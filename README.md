@@ -3,6 +3,8 @@
 **Bayesian nowcast + forecast of rental price pressure at SA2 level (Western Australia).**  
 Outputs a Top‑20 list, an interactive map, and a spreadsheet of probabilities that **next month’s median rent rises by more than 2%** (default threshold), with automatic monthly back‑testing once new data lands.
 
+**Live site:** https://wa-rental-forecast.netlify.app
+
 ---
 
 ## Table of contents
@@ -17,6 +19,7 @@ Outputs a Top‑20 list, an interactive map, and a spreadsheet of probabilities 
 - [Outputs](#outputs)
 - [Models](#models)
 - [Evaluation & back‑testing](#evaluation--back-testing)
+- [Website (static site + Netlify)](#website-static-site--netlify)
 - [Automation (cron / WSL)](#automation-cron--wsl)
 - [Performance tips](#performance-tips)
 - [Troubleshooting](#troubleshooting)
@@ -83,6 +86,7 @@ src/
   model_forecast.py           # PyMC hierarchical logistic forecast
   validate_and_report.py      # Top‑20 CSV, folium map, PNG bar chart (fast)
   evaluate_forecasts.py       # Back‑testing + named Excel export
+  build_site.py               # Static site generator into docs/
   run_all.py                  # Orchestrates end‑to‑end run
   column_templates.py         # Column template utilities for ingestion
   config.py                   # Paths/thresholds/seeds; edit here
@@ -90,15 +94,16 @@ src/
 scripts/
   monthly_job.sh              # Activates venv, runs pipeline + evaluation, logs
 
-data_raw/     # (not committed) AHDAP ZIPs, ABS GeoPackage, ABS correspondence
-data_stage/   # (not committed) parquet intermediates
-data_out/     # (not committed) CSV/XLSX outputs
-figures/      # (not committed) PNGs
-reports/      # (not committed) HTML map
-logs/         # (not committed) run logs
+docs/                         # (committed) Static site (index.html, data/, geojson)
+data_raw/                     # (ignored) AHDAP ZIPs, ABS GeoPackage, ABS correspondence
+data_stage/                   # (ignored) parquet intermediates
+data_out/                     # (ignored) CSV/XLSX outputs
+figures/                      # (ignored) PNGs
+reports/                      # (ignored) Folium HTML map
+logs/                         # (ignored) run logs
 ```
 
-> **Keep the repo small.** Don’t commit `data_*`, `reports/`, `figures/`, `logs/`. See `.gitignore` in [Troubleshooting](#troubleshooting).
+> **Keep the repo small.** Don’t commit `data_*`, `reports/`, `figures/`, `logs/`. The `.gitignore` below handles this.
 
 ---
 
@@ -130,16 +135,12 @@ data_raw/
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
-
-# Core packages
-pip install pandas numpy pyarrow geopandas pyogrio shapely folium branca \
-            pymc arviz pytensor matplotlib requests tqdm
+pip install -r requirements.txt
 ```
 
 ### Option B — Conda/Mamba (faster PyMC sampling)
 ```bash
-mamba create -n wa-rental-forecast python=3.12 pymc arviz pytensor \
-             pandas numpy pyarrow geopandas pyogrio shapely folium branca matplotlib
+mamba create -n wa-rental-forecast python=3.12 pymc arviz pytensor              pandas numpy pyarrow geopandas pyogrio shapely folium branca matplotlib requests tqdm openpyxl
 mamba activate wa-rental-forecast
 ```
 
@@ -158,8 +159,8 @@ All paths & constants live in `src/config.py`. Key settings:
 - **Model**:
   - `RENT_GROWTH_THRESHOLD = 0.02`  *(2% default threshold for a “rise”)*
   - `RANDOM_SEED = 42`
-- **Map performance** (in `validate_and_report.py`):
-  - `SIMPLIFY_TOL_M = 150` meters (raise to 300–500 for smaller/faster HTML)
+- **Map performance**:
+  - `validate_and_report.py` simplifies geometries in meters for faster HTML.
 
 ---
 
@@ -245,33 +246,73 @@ Until the next month’s panel exists, it will print:
 
 ---
 
+## Website (static site + Netlify)
+
+The repo contains a generator that builds a static site into **`docs/`**:
+
+```bash
+python -m src.build_site
+# Produces:
+# docs/index.html
+# docs/sa2_wa_simplified.geojson
+# docs/data/months.json
+# docs/data/YYYY-MM.json (per-month)
+# docs/summary.json (metrics per month once actuals exist)
+```
+
+You can open locally:
+```bash
+python -m http.server --directory docs 8000
+# then visit http://localhost:8000
+```
+
+**Deploy to Netlify (recommended, no server required):**
+```bash
+# one-time
+npm i -g netlify-cli
+netlify login
+netlify link  # select your wa-rental-forecast site, or use: netlify link --id <API_ID>
+
+# build + deploy
+python -m src.build_site
+netlify deploy --dir=docs --prod
+```
+
+Optional `docs/_headers` (cache hints):
+```
+/index.html
+  Cache-Control: no-cache
+
+/sa2_wa_simplified.geojson
+  Cache-Control: public, max-age=31536000, immutable
+
+/data/*
+  Cache-Control: public, max-age=3600
+```
+
+---
+
 ## Automation (cron / WSL)
 
-The repo includes `scripts/monthly_job.sh` which:
-- activates your venv
-- runs `src.run_all` + `src.evaluate_forecasts`
-- logs to `logs/run_all_<timestamp>.log`
+Use `scripts/monthly_job.sh` to run the full pipeline and publish the site. Example crontab (7:30 on the 5th each month):
 
-**Set a monthly cron (WSL/Ubuntu):**
-```bash
-crontab -e
-# 07:30 on the 5th of every month:
-30 7 5 * * /home/<you>/projects/wa_rental_forecast/scripts/monthly_job.sh
+```
+30 7 5 * * /home/<you>/projects/wa_rental_pressure/scripts/monthly_job.sh
 ```
 
-**Test manually anytime:**
-```bash
-./scripts/monthly_job.sh
-```
+The script does:
+1) Activate venv  
+2) `src.run_all` → `src.evaluate_forecasts`  
+3) `src.build_site`  
+4) `netlify deploy --dir=docs --prod` (if the CLI is available)
 
-> Optional: add a Slack/Discord webhook to the script to ping on completion.
+Logs are written to `logs/run_all_<timestamp>.log`.
 
 ---
 
 ## Performance tips
 
-- **Map speed**: geometries are simplified in meters (`SIMPLIFY_TOL_M`), properties limited to code/name/prob.  
-  Bump to **300–500 m** if you want a much smaller HTML.
+- **Map speed**: geometries are simplified in meters for the folium map and for the static site; increase the tolerance for smaller files.  
 - **Sampling speed**: consider a Conda/Mamba environment for optimized BLAS; or reduce `draws`/`tune` for dev runs.
 - **Run‑time knobs** (safe defaults in code): `draws=1000`, `tune=1000`, `chains=4`, `target_accept=0.95`.
 
@@ -285,28 +326,17 @@ crontab -e
 - Script prints: `poa=... sa2=... ratio=... scale=ratio/percent rows=...`
 
 **Timestamp not JSON serializable**  
-- Fixed: the map strips datetime fields before GeoJSON, only keeps minimal properties.
+- Fixed: the site builder strips/normalizes datetimes before serializing.
 
 **Folium map feels slow**  
-- We simplify geometries in meters; raise `SIMPLIFY_TOL_M` for more speed/smaller HTML.
+- Geometries are simplified in meters; raise tolerance for more speed/smaller HTML.
 
 **PyMC `MutableData` missing / BLAS warning**  
-- Not used: the models work with NumPy arrays (PyMC3+ compatible).  
+- Not used: the models work with NumPy arrays (PyMC 5).  
 - BLAS warning = performance only; Conda builds usually resolve it.
 
 **Keep the repo small**  
-Create `.gitignore` in repo root:
-```gitignore
-/data_raw/
-/data_stage/
-/data_out/
-/reports/
-/figures/
-/logs/
-__pycache__/
-*.pyc
-*.pyo
-```
+See `.gitignore` below; do **not** commit `data_*`, `figures/`, `reports/`, `logs/`.
 
 ---
 
@@ -316,7 +346,7 @@ __pycache__/
 - **Pooling**: SA3 random intercepts above SA2.  
 - **Calibration**: Platt/isotonic scaling if over/under‑confident.  
 - **Notifications**: Slack/Discord webhook summary after each run.  
-- **Distribution**: simple `Makefile` and/or `environment.yml`.
+- **Distribution**: `environment.yml` for Conda users.
 
 ---
 
