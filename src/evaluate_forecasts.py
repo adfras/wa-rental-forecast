@@ -118,8 +118,10 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD):
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1) Latest predictions (write plain + named spreadsheets)
-    preds = pd.read_parquet(STAGE_DIR / "price_pressure_forecast_sa2.parquet").copy()
+    # 1) Predictions — prefer full history if available
+    hist_path = STAGE_DIR / "price_pressure_forecast_sa2_history.parquet"
+    preds_path = hist_path if hist_path.exists() else (STAGE_DIR / "price_pressure_forecast_sa2.parquet")
+    preds = pd.read_parquet(preds_path).copy()
     preds["month"] = _to_month(preds["month"])
     preds["sa2_code"] = preds["sa2_code"].astype(str)
 
@@ -139,14 +141,16 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD):
 
     # 2) Score predictions where realized outcomes exist
     labels = _build_realized_labels(threshold)
+    # Inner join so we only score months where both prediction and actual exist
     joined = preds.merge(labels, on=["sa2_code", "month"], how="inner")
     if joined.empty:
         print("No realized months yet to score. (Run again once the next bond ZIP is ingested.)")
         return
 
-    # Summary metrics per month
+    # Summary metrics per month (over all months with realized labels)
     summary_rows = []
-    for m, dfm in joined.groupby("month"):
+    per_month_groups = list(joined.groupby("month"))
+    for m, dfm in per_month_groups:
         y = dfm["actual_jump"].astype(int).to_numpy()
         p = dfm["price_pressure_prob"].astype(float).to_numpy()
 
@@ -176,34 +180,34 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD):
     summary.to_csv(summary_path, index=False)
     print(f"Wrote {summary_path}")
 
-    # 3) Detailed & calibration for latest scored month
-    latest_scored = summary["month"].max()
-    detail = joined.loc[joined["month"] == latest_scored].copy()
-    det_path = EVAL_DIR / f"forecast_eval_details_{latest_scored:%Y-%m}.csv"
-    detail.to_csv(det_path, index=False)
-    print(f"Wrote {det_path}")
+    # 3) Detailed & calibration for each scored month
+    for m, dfm in per_month_groups:
+        detail = dfm.copy()
+        det_path = EVAL_DIR / f"forecast_eval_details_{m:%Y-%m}.csv"
+        detail.to_csv(det_path, index=False)
+        print(f"Wrote {det_path}")
 
-    cal = _calibration_bins(
-        detail["actual_jump"].astype(int).to_numpy(),
-        detail["price_pressure_prob"].astype(float).to_numpy(),
-        bins=10,
-    )
-    cal_path = EVAL_DIR / f"forecast_calibration_{latest_scored:%Y-%m}.csv"
-    cal.to_csv(cal_path, index=False)
-    print(f"Wrote {cal_path}")
+        cal = _calibration_bins(
+            detail["actual_jump"].astype(int).to_numpy(),
+            detail["price_pressure_prob"].astype(float).to_numpy(),
+            bins=10,
+        )
+        cal_path = EVAL_DIR / f"forecast_calibration_{m:%Y-%m}.csv"
+        cal.to_csv(cal_path, index=False)
+        print(f"Wrote {cal_path}")
 
-    # Calibration plot
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.plot(cal["pred"], cal["actual"], marker="o")
-    ax.plot([0, 1], [0, 1], linestyle="--")
-    ax.set_xlabel("Predicted probability (bin mean)")
-    ax.set_ylabel("Observed frequency")
-    ax.set_title(f"Calibration — {latest_scored:%Y-%m}")
-    fig.tight_layout()
-    png = FIG_DIR / f"forecast_calibration_{latest_scored:%Y-%m}.png"
-    fig.savefig(png, dpi=160)
-    plt.close(fig)
-    print(f"Wrote {png}")
+        # Calibration plot per month
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.plot(cal["pred"], cal["actual"], marker="o")
+        ax.plot([0, 1], [0, 1], linestyle="--")
+        ax.set_xlabel("Predicted probability (bin mean)")
+        ax.set_ylabel("Observed frequency")
+        ax.set_title(f"Calibration — {m:%Y-%m}")
+        fig.tight_layout()
+        png = FIG_DIR / f"forecast_calibration_{m:%Y-%m}.png"
+        fig.savefig(png, dpi=160)
+        plt.close(fig)
+        print(f"Wrote {png}")
 
 if __name__ == "__main__":
     main()
