@@ -64,13 +64,13 @@ ABS SA2 GeoPackage ────────────────────�
                          ↓
    data_stage/price_pressure_forecast_sa2.parquet
                          ↓
-     validate_and_report.py + evaluate_forecasts.py
-      ├─ data_out/top20_pressure_risers.csv
-      ├─ data_out/price_pressure_forecast_sa2_latest[_named].xlsx
-      ├─ reports/map_price_pressure.html
-      ├─ figures/top20_pressure_risers.png
-      ├─ data_out/forecast_eval_summary.csv (once actuals exist)
-      └─ figures/forecast_calibration_YYYY‑MM.png (once actuals exist)
+      validate_and_report.py + evaluate_forecasts.py
+      ├─ outputs/tables/top20_pressure_risers.csv
+      ├─ outputs/tables/price_pressure_forecast_sa2_latest[_named].xlsx
+      ├─ outputs/reports/map_price_pressure.html
+      ├─ outputs/figures/top20_pressure_risers.png
+      ├─ outputs/evaluations/forecast_eval_summary.csv (once actuals exist)
+      └─ outputs/figures/forecast_calibration_YYYY‑MM.png (once actuals exist)
 ```
 
 ---
@@ -97,13 +97,16 @@ scripts/
 docs/                         # (committed) Static site (index.html, data/, geojson)
 data_raw/                     # (ignored) AHDAP ZIPs, ABS GeoPackage, ABS correspondence
 data_stage/                   # (ignored) parquet intermediates
-data_out/                     # (ignored) CSV/XLSX outputs
-figures/                      # (ignored) PNGs
-reports/                      # (ignored) Folium HTML map
-logs/                         # (ignored) run logs
+outputs/                      # (ignored) all generated artifacts
+  tables/                     #   CSV/XLSX (Top‑20, full spreadsheets)
+  figures/                    #   PNGs (bar charts, calibration)
+  reports/                    #   Folium HTML map
+  evaluations/                #   Evaluation CSVs (summary, details, calibration CSV)
+  tests/                      #   Test artifacts (reserved)
+  logs/                       #   Run logs (cron/test output)
 ```
 
-> **Keep the repo small.** Don’t commit `data_*`, `reports/`, `figures/`, `logs/`. The `.gitignore` below handles this.
+> **Keep the repo small.** Don’t commit `data_*` or `outputs/`. The `.gitignore` below handles this.
 
 ---
 
@@ -185,24 +188,24 @@ python -m src.validate_and_report
 python -m src.evaluate_forecasts
 ```
 
-> When everything is wired, `evaluate_forecasts.py` produces:
-> - `data_out/price_pressure_forecast_sa2_latest.xlsx`
-> - `data_out/price_pressure_forecast_sa2_latest_named.xlsx`  
-> and after the next data drop: `forecast_eval_*` files.
+> When everything is wired, outputs land under `outputs/`:
+> - `outputs/tables/price_pressure_forecast_sa2_latest.xlsx`
+> - `outputs/tables/price_pressure_forecast_sa2_latest_named.xlsx`  
+> and after the next data drop: `outputs/evaluations/forecast_eval_*` files.
 
 ---
 
 ## Outputs
 
-- `data_out/top20_pressure_risers.csv` – Top‑20 SA2 codes by probability.  
-- `data_out/price_pressure_forecast_sa2_latest.xlsx` – All SA2s (code, month, probability).  
-- `data_out/price_pressure_forecast_sa2_latest_named.xlsx` – Same + **SA2 names**.  
-- `reports/map_price_pressure.html` – Interactive SA2 map (fast, simplified geometries).  
-- `figures/top20_pressure_risers.png` – Static bar chart (top‑20).  
+- `outputs/tables/top20_pressure_risers.csv` – Top‑20 SA2 codes by probability.  
+- `outputs/tables/price_pressure_forecast_sa2_latest.xlsx` – All SA2s (code, month, probability).  
+- `outputs/tables/price_pressure_forecast_sa2_latest_named.xlsx` – Same + **SA2 names**.  
+- `outputs/reports/map_price_pressure.html` – Interactive SA2 map (fast, simplified geometries).  
+- `outputs/figures/top20_pressure_risers.png` – Static bar chart (top‑20).  
 - **After actuals exist** (next month):  
-  - `data_out/forecast_eval_summary.csv` – AUC, Brier, log‑loss by month.  
-  - `data_out/forecast_eval_details_YYYY‑MM.csv` – Row‑level truth vs prob.  
-  - `data_out/forecast_calibration_YYYY‑MM.csv` & `figures/forecast_calibration_YYYY‑MM.png`.
+  - `outputs/evaluations/forecast_eval_summary.csv` – AUC, Brier, log‑loss by month.  
+  - `outputs/evaluations/forecast_eval_details_YYYY‑MM.csv` – Row‑level truth vs prob.  
+  - `outputs/evaluations/forecast_calibration_YYYY‑MM.csv` & `outputs/figures/forecast_calibration_YYYY‑MM.png`.
 
 **Interpretation**: A value of **0.82** means an **82%** chance that next month’s median rent for that SA2 rises by **> 2%**.
 
@@ -306,7 +309,12 @@ The script does:
 3) `src.build_site`  
 4) `netlify deploy --dir=docs --prod` (if the CLI is available)
 
-Logs are written to `logs/run_all_<timestamp>.log`.
+Logs are written to `outputs/logs/run_all_<timestamp>.log`.
+
+Cron tips:
+- PATH: cron often lacks `/usr/local/bin` (where `netlify` lives). The script now exports a safe PATH; alternatively set in crontab: `PATH=/usr/local/bin:/usr/bin:/bin`.
+- Netlify auth: ensure you’ve run `netlify login` under the same user so cron inherits credentials. For headless servers, set `NETLIFY_AUTH_TOKEN` in the crontab env.
+- Debugging: check the latest `outputs/logs/run_all_*.log` for lines showing `which netlify` and the deploy command.
 
 ---
 
@@ -336,7 +344,7 @@ Logs are written to `logs/run_all_<timestamp>.log`.
 - BLAS warning = performance only; Conda builds usually resolve it.
 
 **Keep the repo small**  
-See `.gitignore` below; do **not** commit `data_*`, `figures/`, `reports/`, `logs/`.
+See `.gitignore` below; do **not** commit `data_*` or anything in `outputs/`.
 
 ---
 

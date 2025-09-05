@@ -7,9 +7,14 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 RAW_DIR = BASE_DIR / "data_raw"
 
 STAGE_DIR = BASE_DIR / "data_stage"
-OUT_DIR = BASE_DIR / "data_out"
-FIG_DIR = BASE_DIR / "figures"
-REPORT_DIR = BASE_DIR / "reports"
+
+# Consolidated outputs root and subfolders
+OUTPUTS_DIR = BASE_DIR / "outputs"
+OUT_DIR = OUTPUTS_DIR / "tables"          # CSV/XLSX tables
+FIG_DIR = OUTPUTS_DIR / "figures"          # PNGs and plots
+REPORT_DIR = OUTPUTS_DIR / "reports"       # Folium HTML, other reports
+EVAL_DIR = OUTPUTS_DIR / "evaluations"     # Evaluation CSVs/metrics
+TESTS_OUT_DIR = OUTPUTS_DIR / "tests"      # Test artifacts (reserved)
 
 # External sources (adjust if portals change)
 CKAN_BASE = "https://housing-data-exchange.ahdap.org"
@@ -27,5 +32,5 @@ RENT_GROWTH_THRESHOLD = 0.02  # 2% month-over-month
 RANDOM_SEED = 42
 
 def ensure_dirs():
-    for d in [RAW_DIR, STAGE_DIR, OUT_DIR, FIG_DIR, REPORT_DIR]:
+    for d in [RAW_DIR, STAGE_DIR, OUTPUTS_DIR, OUT_DIR, FIG_DIR, REPORT_DIR, EVAL_DIR, TESTS_OUT_DIR]:
         d.mkdir(parents=True, exist_ok=True)

@@ -12,6 +12,7 @@ from src.config import (
     STAGE_DIR,
     OUT_DIR,
     FIG_DIR,
+    EVAL_DIR,
     ASGS_SA2_GPKG,
     RENT_GROWTH_THRESHOLD,
 )
@@ -115,6 +116,7 @@ def _build_realized_labels(threshold: float) -> pd.DataFrame:
 def main(threshold: float = RENT_GROWTH_THRESHOLD):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     FIG_DIR.mkdir(parents=True, exist_ok=True)
+    EVAL_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1) Latest predictions (write plain + named spreadsheets)
     preds = pd.read_parquet(STAGE_DIR / "price_pressure_forecast_sa2.parquet").copy()
@@ -170,14 +172,14 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD):
         })
 
     summary = pd.DataFrame(summary_rows).sort_values("month")
-    summary_path = OUT_DIR / "forecast_eval_summary.csv"
+    summary_path = EVAL_DIR / "forecast_eval_summary.csv"
     summary.to_csv(summary_path, index=False)
     print(f"Wrote {summary_path}")
 
     # 3) Detailed & calibration for latest scored month
     latest_scored = summary["month"].max()
     detail = joined.loc[joined["month"] == latest_scored].copy()
-    det_path = OUT_DIR / f"forecast_eval_details_{latest_scored:%Y-%m}.csv"
+    det_path = EVAL_DIR / f"forecast_eval_details_{latest_scored:%Y-%m}.csv"
     detail.to_csv(det_path, index=False)
     print(f"Wrote {det_path}")
 
@@ -186,7 +188,7 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD):
         detail["price_pressure_prob"].astype(float).to_numpy(),
         bins=10,
     )
-    cal_path = OUT_DIR / f"forecast_calibration_{latest_scored:%Y-%m}.csv"
+    cal_path = EVAL_DIR / f"forecast_calibration_{latest_scored:%Y-%m}.csv"
     cal.to_csv(cal_path, index=False)
     print(f"Wrote {cal_path}")
 

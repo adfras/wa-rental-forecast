@@ -118,6 +118,21 @@ def fit_forecast():
     })
     out.to_parquet(STAGE_DIR / "price_pressure_forecast_sa2.parquet", index=False)
     print("Wrote price-pressure forecast → data_stage/price_pressure_forecast_sa2.parquet")
+    
+    # ---- maintain an append-only history for the website time slider ----
+    hist_path = STAGE_DIR / "price_pressure_forecast_sa2_history.parquet"
+    try:
+        old = pd.read_parquet(hist_path)
+        combined = (pd.concat([old, out], ignore_index=True)
+                    .drop_duplicates(subset=["sa2_code", "month"])
+                    .sort_values(["sa2_code", "month"]))
+    except FileNotFoundError:
+        combined = out.copy()
+
+    combined.to_parquet(hist_path, index=False)
+    print(f"Updated forecast history → {hist_path} (months={combined['month'].nunique()})")
+    
+    
     return idata
 
 if __name__ == "__main__":
