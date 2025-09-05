@@ -24,6 +24,8 @@ mkdir -p outputs/logs
   python -m src.run_all
 
   echo ">>> $(date) python -m src.evaluate_forecasts"
+  # Ensure history includes all months from site JSON before evaluating
+  python -m src.backfill_forecast_history || true
   python -m src.evaluate_forecasts || true
 
   echo ">>> $(date) python -m src.build_site"
