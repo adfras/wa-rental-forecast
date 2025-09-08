@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -19,8 +20,11 @@ from src.config import (
 
 # -------------------- small utilities --------------------
 
-def _to_month(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s).dt.to_period("M").dt.to_timestamp()
+def _to_month(s) -> pd.Series:
+    dt = pd.to_datetime(s)
+    if hasattr(dt, "dt"):
+        return dt.dt.to_period("M").dt.to_timestamp()
+    return dt.to_period("M").to_timestamp()
 
 def _first_present(cols: list[str], candidates: list[str]) -> str:
     for c in candidates:
@@ -113,7 +117,7 @@ def _build_realized_labels(threshold: float) -> pd.DataFrame:
 
 # -------------------- main entrypoint --------------------
 
-def main(threshold: float = RENT_GROWTH_THRESHOLD):
+def main(threshold: float = RENT_GROWTH_THRESHOLD, start: str | None = None, end: str | None = None):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -124,6 +128,12 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD):
     preds = pd.read_parquet(preds_path).copy()
     preds["month"] = _to_month(preds["month"])
     preds["sa2_code"] = preds["sa2_code"].astype(str)
+
+    # Optional month window filter (inclusive)
+    if start or end:
+        start_m = _to_month(start) if start else preds["month"].min()
+        end_m = _to_month(end) if end else preds["month"].max()
+        preds = preds[(preds["month"] >= start_m) & (preds["month"] <= end_m)].copy()
 
     latest_month = preds["month"].max()
     latest = preds.loc[preds["month"] == latest_month].copy()
@@ -210,4 +220,10 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD):
         print(f"Wrote {png}")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Evaluate forecast accuracy; optionally filter months.")
+    parser.add_argument("--threshold", type=float, default=RENT_GROWTH_THRESHOLD,
+                        help=f"Rent growth threshold (default {RENT_GROWTH_THRESHOLD})")
+    parser.add_argument("--start", type=str, default=None, help="Start month YYYY-MM (inclusive)")
+    parser.add_argument("--end", type=str, default=None, help="End month YYYY-MM (inclusive)")
+    args = parser.parse_args()
+    main(threshold=args.threshold, start=args.start, end=args.end)

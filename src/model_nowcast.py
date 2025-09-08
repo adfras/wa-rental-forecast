@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 import arviz as az
+import argparse
 from src.config import STAGE_DIR, RANDOM_SEED
 
 def build_data():
@@ -24,7 +25,7 @@ def build_data():
 
     return df, y, log_stock, t, season, sa2_idx, len(sa2_codes)
 
-def fit_nowcast():
+def fit_nowcast(draws: int = 1000, tune: int = 1000, chains: int = 4, cores: int = 4):
     df, y, log_stock, t, season, sa2_idx, n_sa2 = build_data()
     N = len(y)
 
@@ -53,7 +54,7 @@ def fit_nowcast():
         pm.NegativeBinomial("y", mu=mu, alpha=alpha_nb, observed=y)
 
         idata = pm.sample(
-            draws=1000, tune=1000, chains=4, target_accept=0.95,
+            draws=draws, tune=tune, chains=chains, cores=cores, target_accept=0.95,
             random_seed=RANDOM_SEED, progressbar=True
         )
 
@@ -69,4 +70,10 @@ def fit_nowcast():
     return idata
 
 if __name__ == "__main__":
-    fit_nowcast()
+    ap = argparse.ArgumentParser(description="Fit NB nowcast with offset and write availability file")
+    ap.add_argument("--draws", type=int, default=1000)
+    ap.add_argument("--tune", type=int, default=1000)
+    ap.add_argument("--chains", type=int, default=4)
+    ap.add_argument("--cores", type=int, default=4)
+    args = ap.parse_args()
+    fit_nowcast(draws=args.draws, tune=args.tune, chains=args.chains, cores=args.cores)

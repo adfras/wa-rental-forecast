@@ -74,15 +74,15 @@ def _read_docs_predictions() -> pd.DataFrame:
         except Exception:
             continue
         for sa2_code, rec in obj.items():
-            pval = None
-            try:
-                pval = rec.get("p", None)
-            except Exception:
-                pass
+            pval = rec.get("p", None)
+            lval = rec.get("l", None)
+            uval = rec.get("u", None)
             rows.append({
                 "sa2_code": str(sa2_code),
                 "month": pd.to_datetime(month_str).to_period("M").to_timestamp(),
                 "price_pressure_prob": (None if pval is None else float(pval)),
+                "prob_p05": (None if lval is None else float(lval)),
+                "prob_p95": (None if uval is None else float(uval)),
             })
     if not rows:
         return pd.DataFrame(columns=["sa2_code", "month", "price_pressure_prob"]).astype({"sa2_code": str})
@@ -198,9 +198,11 @@ def build_monthly_data():
         dfm = joined[joined["month"] == m]
         payload = {}
         for _, r in dfm.iterrows():
-            p = None if pd.isna(r["price_pressure_prob"]) else float(r["price_pressure_prob"])
+            p = None if pd.isna(r.get("price_pressure_prob", np.nan)) else float(r["price_pressure_prob"])
+            l = None if pd.isna(r.get("prob_p05", np.nan)) else float(r["prob_p05"])
+            u = None if pd.isna(r.get("prob_p95", np.nan)) else float(r["prob_p95"])
             y = (None if pd.isna(r.get("actual", np.nan)) else int(bool(r["actual"])))
-            payload[str(r["sa2_code"])] = {"p": p, "y": y}
+            payload[str(r["sa2_code"])] = {"p": p, "l": l, "u": u, "y": y}
         _write_json(DATA_DIR / f"{pd.Timestamp(m).strftime('%Y-%m')}.json", payload)
 
     # Summary metrics (AUC, Brier) per month where actuals exist
@@ -220,16 +222,30 @@ def build_monthly_data():
     def _brier(y, p):
         y = np.asarray(y).astype(float); p = np.asarray(p).astype(float)
         return float(np.mean((p - y) ** 2))
+    def _log_loss(y, p, eps: float = 1e-12):
+        y = np.asarray(y).astype(int); p = np.asarray(p).astype(float)
+        p = np.clip(p, eps, 1 - eps)
+        return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
 
     summary = {}
     for m, dfm in joined.dropna(subset=["actual"]).groupby("month"):
         p = dfm["price_pressure_prob"].to_numpy()
         y = dfm["actual"].astype(int).to_numpy()
+        thr = 0.5
+        yhat = (p >= thr).astype(int)
+        tp = int(((yhat == 1) & (y == 1)).sum())
+        fp = int(((yhat == 1) & (y == 0)).sum())
+        tn = int(((yhat == 0) & (y == 0)).sum())
+        fn = int(((yhat == 0) & (y == 1)).sum())
         summary[pd.Timestamp(m).strftime("%Y-%m")] = {
             "n_sa2": int(len(dfm)),
             "base_rate": float(y.mean()),
             "auc": _roc_auc(y, p),
             "brier": _brier(y, p),
+            "log_loss": _log_loss(y, p),
+            "precision_at_0_5": (tp / (tp + fp)) if (tp + fp) else float("nan"),
+            "recall_at_0_5": (tp / (tp + fn)) if (tp + fn) else float("nan"),
+            "accuracy_at_0_5": ((tp + tn) / len(dfm)) if len(dfm) else float("nan"),
         }
     _write_json(DATA_DIR / "summary.json", summary)
 
@@ -262,6 +278,17 @@ INDEX_HTML = r"""<!doctype html>
   }
   .pill { display:inline-block; padding:2px 6px; border-radius:10px; background:#f1f1f1; margin-left:6px; }
   .tooltip-line { margin:0; }
+  .key-btn { margin-left: 6px; }
+  .key-panel {
+    position: absolute; right: 10px; top: 10px; z-index: 1100;
+    background: rgba(255,255,255,0.97); padding: 12px 14px; border-radius: 8px; width: 360px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.2); display: none; font-size: 12px;
+  }
+  .key-panel h2 { margin: 0 0 8px; font-size: 14px; }
+  .key-section { margin-bottom: 10px; }
+  .swatch { display:inline-block; width:18px; height:12px; border:1px solid #999; margin-right:6px; vertical-align:middle; }
+  .gradbar { height: 10px; border:1px solid #999; margin: 4px 0; }
+  .key-close { position:absolute; top:6px; right:8px; border:none; background:#eee; border-radius:4px; cursor:pointer; }
 </style>
 </head>
 <body>
@@ -274,6 +301,7 @@ INDEX_HTML = r"""<!doctype html>
     <select id="metric">
       <option value="forecast">Forecast probability (Pr[Δrent&gt;2%])</option>
       <option value="actual">Actual outcome (rise &gt; 2%)</option>
+      <option value="correct60">Correct @ 0.60 (green = correct)</option>
       <option value="error">Error (prob − actual)</option>
       <option value="abserr">Abs. error |prob − actual|</option>
     </select>
@@ -284,8 +312,11 @@ INDEX_HTML = r"""<!doctype html>
     <span id="monthLabel" class="pill">—</span>
     <button id="playBtn">▶</button>
   </div>
+  <div class="row"></div>
   <div class="legend" id="legend"></div>
 </div>
+
+<!-- removed key panel; legend explains active metric -->
 
 <div class="footer">
   <span id="metrics">No evaluation yet for this month.</span>
@@ -296,6 +327,8 @@ INDEX_HTML = r"""<!doctype html>
 let map, layer, months=[], monthIdx=0;
 let monthData = null;     // { sa2_code: {p: float|null, y: 0|1|null} }
 let summary = {};         // { "YYYY-MM": {auc,brier,base_rate,n_sa2} }
+const threshold = 0.5;    // default for footer metrics (kept)
+const threshold60 = 0.6;  // cutoff for "Correct @ 0.60" metric
 
 function fmtPct(x) {
   const v = Number.parseFloat(x);
@@ -328,6 +361,20 @@ function colorAbsErr(ae){ if(ae==null || isNaN(ae)) return "#d9d9d9";
     return lerpColor(stops[i-1][1],stops[i][1],t); } }
   return stops[stops.length-1][1];
 }
+function colorCorrect(correct){
+  if(correct==null) return "#d9d9d9";
+  return correct ? "#31a354" : "#ef3b2c"; // green for correct, red for incorrect
+}
+function colorConfusion(kind){
+  // kind: 'TP','TN','FP','FN', null -> grey
+  switch(kind){
+    case 'TP': return '#1a9850'; // dark green
+    case 'TN': return '#74add1'; // blue
+    case 'FP': return '#fdae61'; // orange
+    case 'FN': return '#d73027'; // red
+    default: return '#d9d9d9';
+  }
+}
 function lerpColor(a,b,t){
   const pa=parseInt(a.slice(1),16), pb=parseInt(b.slice(1),16);
   const ar=(pa>>16)&0xff, ag=(pa>>8)&0xff, ab=pa&0xff;
@@ -349,14 +396,23 @@ function setLegend(kind){
         <span style="display:inline-block;width:18px;height:12px;background:#c7e9c0;border:1px solid #999;margin-left:10px;"></span> not rise
         <span style="display:inline-block;width:18px;height:12px;background:#d9d9d9;border:1px solid #999;margin-left:10px;"></span> n/a
       </div>`;
+  } else if(kind==="correct60"){
+    el.innerHTML = `<div><b>Correct @ 0.60</b> (p ≥ 0.60 vs actual)</div>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <span style="display:inline-block;width:18px;height:12px;background:#31a354;border:1px solid #999"></span> correct
+        <span style="display:inline-block;width:18px;height:12px;background:#ef3b2c;border:1px solid #999;margin-left:10px;"></span> incorrect
+        <span style="display:inline-block;width:18px;height:12px;background:#d9d9d9;border:1px solid #999;margin-left:10px;"></span> n/a
+      </div>`;
   } else if(kind==="error"){
     el.innerHTML = `<div><b>Error</b> (prob − actual)</div>
       <div class="grad-div" style="height:10px;background:linear-gradient(to right,#2166ac,#67a9cf,#f7f7f7,#ef8a62,#b2182b)"></div>
       <div style="display:flex;justify-content:space-between;"><span>-1</span><span>0</span><span>+1</span></div>`;
   } else {
-    el.innerHTML = `<div><b>Absolute error</b> |prob − actual|</div>
-      <div class="grad" style="height:10px;background:linear-gradient(to right,#f7fcb9,#addd8e,#31a354,#006837)"></div>
-      <div style="display:flex;justify-content:space-between;"><span>0</span><span>1</span></div>`;
+    if(kind==="abserr"){
+      el.innerHTML = `<div><b>Absolute error</b> |prob − actual|</div>
+        <div class="grad" style="height:10px;background:linear-gradient(to right,#f7fcb9,#addd8e,#31a354,#006837)"></div>
+        <div style="display:flex;justify-content:space-between;"><span>0</span><span>1</span></div>`;
+    }
   }
 }
 
@@ -368,10 +424,15 @@ function styleFeature(feat){
   if(rec){
     if(metric==="forecast") fill = colorProb(rec.p);
     else if(metric==="actual") fill = colorActual(rec.y);
+    else if(metric==="correct60"){
+      const yhat = (rec.p==null) ? null : (rec.p >= threshold60 ? 1 : 0);
+      const ok = (rec.y==null || yhat==null) ? null : (yhat===rec.y);
+      fill = colorCorrect(ok);
+    }
     else if(metric==="error"){
       const e = (rec.p==null || rec.y==null) ? null : (rec.p - rec.y);
       fill = colorError(e);
-    } else {
+    } else if(metric==="abserr"){
       const ae = (rec.p==null || rec.y==null) ? null : Math.abs(rec.p - rec.y);
       fill = colorAbsErr(ae);
     }
@@ -384,12 +445,24 @@ function tooltipHTML(feat){
   const name = feat.properties.sa2_name || "";
   const rec = monthData ? monthData[code] : null;
   const p = rec? rec.p : null, y = rec? rec.y : null;
+  const l = rec? rec.l : null, u = rec? rec.u : null;
   const e = (p==null || y==null) ? null : (p - y);
   const ae = (p==null || y==null) ? null : Math.abs(p - y);
+  const metric = document.getElementById("metric").value;
+  
+  const ci = (l==null || u==null) ? '—' : `${fmtPct(l)} – ${fmtPct(u)}`;
+  let extra = '';
+  if(metric === 'correct60'){
+    extra = `
+          <p class="tooltip-line">Predicted (≥0.60): ${p==null? "—" : (p>=threshold60? "Raise":"No raise")}</p>
+          <p class="tooltip-line">Correct @0.60: ${(y==null || p==null) ? "—" : (((p>=threshold60?1:0)===y) ? "Yes" : "No")}</p>`;
+  }
   return `<p class="tooltip-line"><b>${name || code}</b></p>
           <p class="tooltip-line">SA2: ${code}</p>
           <p class="tooltip-line">Forecast: ${fmtPct(p)}</p>
-          <p class="tooltip-line">Actual rise &gt;2%: ${y==null? "—" : (y? "Yes":"No")}</p>
+          <p class="tooltip-line">90% CI: ${ci}</p>
+          <p class="tooltip-line">Actual rise &gt;2%: ${y==null? "—" : (y? "Yes":"No")}</p>${extra}
+          
           <p class="tooltip-line">Error (p−y): ${e==null? "—" : (Math.round(e*1000)/1000)}</p>
           <p class="tooltip-line">|Error|: ${ae==null? "—" : (Math.round(ae*1000)/1000)}</p>`;
 }
@@ -415,7 +488,11 @@ async function loadMonth(idx){
   const brier = (typeof m.brier === 'number' && Number.isFinite(m.brier)) ? m.brier.toFixed(3) : '—';
   const base  = (typeof m.base_rate === 'number') ? (m.base_rate*100).toFixed(1)+'%' : '—';
   const n     = (typeof m.n_sa2 === 'number') ? m.n_sa2 : '—';
-  el.textContent = `AUC ${auc} | Brier ${brier} | Base rate ${base} | n=${n}`;
+  const ll   = (typeof m.log_loss === 'number' && Number.isFinite(m.log_loss)) ? m.log_loss.toFixed(3) : '—';
+  const prec = (typeof m.precision_at_0_5 === 'number' && Number.isFinite(m.precision_at_0_5)) ? (m.precision_at_0_5*100).toFixed(0)+'%' : '—';
+  const rec  = (typeof m.recall_at_0_5 === 'number' && Number.isFinite(m.recall_at_0_5)) ? (m.recall_at_0_5*100).toFixed(0)+'%' : '—';
+  const acc  = (typeof m.accuracy_at_0_5 === 'number' && Number.isFinite(m.accuracy_at_0_5)) ? (m.accuracy_at_0_5*100).toFixed(0)+'%' : '—';
+  el.textContent = `AUC ${auc} | Brier ${brier} | LogLoss ${ll} | Precision ${prec} | Recall ${rec} | Accuracy ${acc} | Base rate ${base} | n=${n}`;
 
   // Repaint and refresh any open tooltips
   layer.setStyle(styleFeature);
@@ -456,6 +533,21 @@ async function init(){
       }
     });
   });
+
+  // Key panel (optional UI) — guard missing DOM nodes
+  const keyBtn = document.getElementById('keyBtn');
+  const keyPanel = document.getElementById('keyPanel');
+  const keyClose = document.getElementById('keyClose');
+  if (keyBtn && keyPanel && keyClose) {
+    keyBtn.addEventListener('click', () => {
+      const t1 = document.getElementById('keyThr1');
+      const t2 = document.getElementById('keyThr2');
+      if (t1) t1.textContent = '@0.50';
+      if (t2) t2.textContent = '@0.50';
+      keyPanel.style.display = 'block';
+    });
+    keyClose.addEventListener('click', () => { keyPanel.style.display = 'none'; });
+  }
 
   // Play/pause
   let playing=false, handle=null;

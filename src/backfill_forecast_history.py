@@ -30,10 +30,14 @@ def _read_docs_predictions() -> pd.DataFrame:
             continue
         for sa2_code, rec in obj.items():
             pval = rec.get("p", None)
+            lval = rec.get("l", None)
+            uval = rec.get("u", None)
             rows.append({
                 "sa2_code": str(sa2_code),
                 "month": pd.to_datetime(month_str).to_period("M").to_timestamp(),
                 "price_pressure_prob": (None if pval is None else float(pval)),
+                "prob_p05": (None if lval is None else float(lval)),
+                "prob_p95": (None if uval is None else float(uval)),
             })
     if not rows:
         return pd.DataFrame(columns=["sa2_code", "month", "price_pressure_prob"]).astype({"sa2_code": str})
@@ -85,4 +89,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

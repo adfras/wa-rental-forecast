@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 import arviz as az
+import argparse
 from src.config import STAGE_DIR, RENT_GROWTH_THRESHOLD, RANDOM_SEED
 
 def _expit(x):
@@ -52,7 +53,7 @@ def build_dataset():
     y = df_model["y"].astype(int).to_numpy()
     return df_model, Xz, y, sa2_idx, len(sa2_codes), feat_cols, mu, sd, df
 
-def fit_forecast():
+def fit_forecast(draws: int = 1000, tune: int = 1000, chains: int = 4, cores: int = 4):
     df_model, Xz, y, sa2_idx, n_sa2, feat_cols, mu, sd, df_full = build_dataset()
     n, k = Xz.shape
 
@@ -68,7 +69,7 @@ def fit_forecast():
         pm.Bernoulli("y", logit_p=eta, observed=y)
 
         idata = pm.sample(
-            draws=1000, tune=1000, chains=4, target_accept=0.9,
+            draws=draws, tune=tune, chains=chains, cores=cores, target_accept=0.9,
             random_seed=RANDOM_SEED, progressbar=True
         )
 
@@ -101,20 +102,30 @@ def fit_forecast():
 
     S = beta_s.shape[0]
 
-    # Compute probabilities per SA2
+    # Compute probabilities per SA2 with posterior quantiles
     probs = np.zeros(len(base), dtype=float)
+    prob_p05 = np.zeros(len(base), dtype=float)
+    prob_p50 = np.zeros(len(base), dtype=float)
+    prob_p95 = np.zeros(len(base), dtype=float)
     for i, row in base.reset_index(drop=True).iterrows():
         idx = int(row["sa2_idx"])
         # (S, k) @ (k,) -> (S,)
         lin = beta_s @ Xp_z[i, :]
         if idx >= 0:
             lin = lin + a_sa2_s[:, idx]
-        probs[i] = _expit(lin).mean()
+        ps = _expit(lin)
+        probs[i] = ps.mean()
+        prob_p05[i] = np.quantile(ps, 0.05)
+        prob_p50[i] = np.quantile(ps, 0.50)
+        prob_p95[i] = np.quantile(ps, 0.95)
 
     out = pd.DataFrame({
         "sa2_code": base["sa2_code"].values,
         "month": (latest_month + pd.offsets.MonthBegin(1)).to_period("M").to_timestamp(),
-        "price_pressure_prob": probs
+        "price_pressure_prob": probs,
+        "prob_p05": prob_p05,
+        "prob_p50": prob_p50,
+        "prob_p95": prob_p95,
     })
     out.to_parquet(STAGE_DIR / "price_pressure_forecast_sa2.parquet", index=False)
     print("Wrote price-pressure forecast → data_stage/price_pressure_forecast_sa2.parquet")
@@ -136,4 +147,10 @@ def fit_forecast():
     return idata
 
 if __name__ == "__main__":
-    fit_forecast()
+    ap = argparse.ArgumentParser(description="Fit hierarchical logistic forecast and write predictions + history")
+    ap.add_argument("--draws", type=int, default=1000)
+    ap.add_argument("--tune", type=int, default=1000)
+    ap.add_argument("--chains", type=int, default=4)
+    ap.add_argument("--cores", type=int, default=4)
+    args = ap.parse_args()
+    fit_forecast(draws=args.draws, tune=args.tune, chains=args.chains, cores=args.cores)

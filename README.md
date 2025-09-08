@@ -25,6 +25,7 @@ Outputs a Top‑20 list, an interactive map, and a spreadsheet of probabilities 
 - [Troubleshooting](#troubleshooting)
 - [Roadmap / ideas](#roadmap--ideas)
 - [License & acknowledgements](#license--acknowledgements)
+ - [Time‑Split & Walk‑Forward](#time-split--walk-forward)
 
 ---
 
@@ -246,6 +247,53 @@ python -m src.evaluate_forecasts
 
 Until the next month’s panel exists, it will print:  
 **“No realized months yet to score.”** (expected)
+
+---
+
+## Time‑Split & Walk‑Forward
+
+This repo includes a helper to train on an early block of months and validate on later months using a strict split (no leakage), plus an optional walk‑forward variant that refits per target month.
+
+Prerequisites: run up to SA2 staging so `data_stage/bonds_panel_sa2.parquet` covers the period of interest.
+
+```
+python -m src.fetch_bonds
+python -m src.process_bonds
+python -m src.map_poa_sa2
+```
+
+Example: Train on Jan–Apr, validate on Jun–Sep
+
+1) Fixed split (single fit):
+```
+python -m src.time_split_validate \
+  --train-start 2025-01 --train-end 2025-04 \
+  --val-start 2025-06 --val-end 2025-09
+```
+This:
+- Fits the Negative Binomial nowcast on Jan–Apr and predicts out‑of‑sample `availability_rate` for the base months (May–Aug).
+- Fits the logistic forecast on Jan–Apr and produces probabilities for the target months (Jun–Sep).
+- Appends predictions to `data_stage/price_pressure_forecast_sa2_history.parquet`.
+
+2) Walk‑forward (operational realism):
+```
+python -m src.time_split_validate \
+  --train-start 2025-01 --train-end 2025-04 \
+  --val-start 2025-06 --val-end 2025-09 \
+  --walk-forward
+```
+For each target month T in Jun..Sep, this refits:
+- Nowcast on all data up to and including T−1 (to estimate availability for base month T−1);
+- Logistic on months from Jan up to T−2 (so labels do not use information at T).
+
+Evaluate just these months (once actuals exist for each):
+```
+python -m src.evaluate_forecasts --start 2025-06 --end 2025-09
+```
+Rebuild the static site (adds/updates docs/data/*.json):
+```
+python -m src.build_site
+```
 
 ---
 
