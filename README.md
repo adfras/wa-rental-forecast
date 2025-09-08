@@ -341,6 +341,16 @@ Optional `docs/_headers` (cache hints):
   Cache-Control: public, max-age=3600
 ```
 
+### Map metrics & legend
+
+- Forecast probability: colors interpolate from light yellow (0) to deep red (1) to show Pr[Δrent > 2%].
+- Actual outcome: red = rise > 2%, green = not rise, grey = n/a (no realized data yet).
+- Correct @ 0.60: uses a 0.60 cutoff to classify a “predicted raise” (prob ≥ 0.60). Green = prediction matches actual; red = prediction does not match; grey = n/a. This cutoff is visualization‑only.
+- Error (prob − actual): blue (negative) → grey (0) → red (positive) diverging scale.
+- Abs. error |prob − actual|: light to dark green with higher values darker.
+
+Note: summary metrics in the footer (precision/recall/accuracy) are computed at a 0.50 threshold and are not affected by the “Correct @ 0.60” view.
+
 ---
 
 ## Automation (cron / WSL)
