@@ -1,4 +1,11 @@
-# scripts/scan_wa_bonds_zip.py
+"""
+Scan a raw WA bonds ZIP and produce:
+ - A Markdown report summarizing detected files, columns and inferred months
+ - A JSON dictionary of observed normalized column names by table type
+
+This is a diagnostic helper to understand source schema variance before
+ingestion. It does not change any downstream behavior.
+"""
 import re, io, json, zipfile, sys
 from pathlib import Path
 from collections import defaultdict
@@ -81,7 +88,7 @@ def classify(name: str) -> str | None:
         return "stock"
     return None
 
-def main():
+def main() -> None:
     zips = sorted(RAW_DIR.glob("wa_bonds_*.zip"))
     if not zips:
         print("No bonds ZIP found in data_raw/. Run fetch first.", file=sys.stderr)

@@ -10,4 +10,4 @@ source .venv/bin/activate
 python -m pip install --upgrade pip wheel setuptools
 pip install -r requirements.txt
 
-echo "Setup complete. Place ABS assets into data_raw/ and run: python -m src.run_all"
+echo "Setup complete. Place ABS assets into data_raw/ and run: python -m src.cli one-click"

@@ -20,16 +20,16 @@ mkdir -p outputs/logs
 
 # Run the full pipeline (fetch → process → map → nowcast → forecast → report)
 {
-  echo ">>> $(date) python -m src.run_all"
-  python -m src.run_all
+  echo ">>> $(date) python -m src.cli run-all"
+  python -m src.cli run-all
 
-  echo ">>> $(date) python -m src.evaluate_forecasts"
+  echo ">>> $(date) python -m src.reporting.evaluate_forecasts"
   # Ensure history includes all months from site JSON before evaluating
-  python -m src.backfill_forecast_history || true
-  python -m src.evaluate_forecasts || true
+  python -m tools.backfill_forecast_history || true
+  python -m src.reporting.evaluate_forecasts || true
 
-  echo ">>> $(date) python -m src.build_site"
-  python -m src.build_site
+  echo ">>> $(date) python -m src.reporting.build_site"
+  python -m src.reporting.build_site
 
   echo ">>> $(date) which netlify"
   command -v netlify || echo "netlify CLI not found (skipping deploy)"
