@@ -3,324 +3,420 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>WA Rental Forecast — SA2 Map</title>
+<title>WA Rental Forecast — Accuracy Overview</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
 <style>
   html, body, #map { height: 100%; margin: 0; }
+  body { font-family: system-ui, sans-serif; color: #1f1f1f; }
   .panel {
-    position: absolute; top: 10px; left: 10px; z-index: 1000;
-    background: rgba(255,255,255,0.94); padding: 10px 12px; border-radius: 8px;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.15); font-family: system-ui, sans-serif; max-width: 420px;
+    position: absolute; top: 12px; left: 12px; z-index: 1000;
+    background: rgba(255,255,255,0.96); padding: 12px 14px; border-radius: 10px;
+    box-shadow: 0 2px 14px rgba(0,0,0,0.16); max-width: 380px;
   }
-  .panel h1 { font-size: 16px; margin: 0 0 8px; }
-  .row { display:flex; gap: 8px; align-items: center; margin: 6px 0; flex-wrap: wrap;}
-  label { font-size: 12px; color:#444; }
+  .panel h1 { font-size: 16px; margin: 0 0 8px; font-weight: 600; }
+  .row { display:flex; gap: 8px; align-items:center; margin: 8px 0; flex-wrap: wrap; }
+  label { font-size: 12px; color: #333; }
   select, input[type=range], button { font-size: 12px; }
-  .legend { margin-top: 6px; font-size: 12px; }
-  .legend .grad { height: 10px; background: linear-gradient(to right,#ffffcc,#ffeda0,#feb24c,#fd8d3c,#f03b20,#bd0026); }
-  .legend .grad-div { height: 10px; background: linear-gradient(to right,#2166ac,#67a9cf,#d1e5f0,#f7f7f7,#fddbc7,#ef8a62,#b2182b); }
+  input[type=range] { flex: 1 1 160px; }
+  #monthLabel { min-width: 56px; text-align: center; padding:2px 8px; border-radius:10px; background:#f0f0f0; }
+  .legend { margin-top: 10px; font-size: 12px; line-height: 1.4; }
+  .legend .grad { height: 10px; border:1px solid #999; margin:4px 0; }
+  .swatch { display:inline-block; width:18px; height:12px; border:1px solid #777; margin-right:6px; vertical-align:middle; }
   .footer {
-    position: absolute; bottom: 8px; left: 10px; z-index: 1000;
-    background: rgba(255,255,255,0.9); padding: 6px 8px; border-radius: 6px; font-size: 12px;
+    position: absolute; bottom: 12px; left: 12px; z-index: 1000;
+    background: rgba(255,255,255,0.92); padding: 8px 10px; border-radius: 8px;
+    font-size: 12px; box-shadow: 0 1px 10px rgba(0,0,0,0.12); max-width: 520px;
   }
-  .pill { display:inline-block; padding:2px 6px; border-radius:10px; background:#f1f1f1; margin-left:6px; }
-  .tooltip-line { margin:0; }
-  .key-btn { margin-left: 6px; }
-  .key-panel {
-    position: absolute; right: 10px; top: 10px; z-index: 1100;
-    background: rgba(255,255,255,0.97); padding: 12px 14px; border-radius: 8px; width: 360px;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.2); display: none; font-size: 12px;
-  }
-  .key-panel h2 { margin: 0 0 8px; font-size: 14px; }
-  .key-section { margin-bottom: 10px; }
-  .swatch { display:inline-block; width:18px; height:12px; border:1px solid #999; margin-right:6px; vertical-align:middle; }
-  .gradbar { height: 10px; border:1px solid #999; margin: 4px 0; }
-  .key-close { position:absolute; top:6px; right:8px; border:none; background:#eee; border-radius:4px; cursor:pointer; }
+  .footer strong { font-weight: 600; }
+  button { border:1px solid #bbb; background:#f7f7f7; border-radius:4px; padding:2px 6px; cursor:pointer; }
+  button:hover { background:#ececec; }
+  #playBtn { width:26px; height:22px; display:flex; align-items:center; justify-content:center; }
 </style>
 </head>
 <body>
 <div id="map"></div>
 
 <div class="panel">
-  <h1>WA Rental Forecast — SA2</h1>
+  <h1>WA Rental Forecast — Accuracy</h1>
   <div class="row">
-    <label for="metric">Metric</label>
+    <label for="thresholdSelect">Event threshold</label>
+    <select id="thresholdSelect"></select>
+  </div>
+  <div class="row">
+    <label for="metric">View</label>
     <select id="metric">
-      <option value="forecast">Forecast probability (Pr[Δrent&gt;2%])</option>
-      <option value="actual">Actual outcome (rise &gt; 2%)</option>
-      <option value="correct60">Correct @ 0.60 (green = correct)</option>
-      <option value="error">Error (prob − actual)</option>
-      <option value="abserr">Abs. error |prob − actual|</option>
+      <option value="forecast">Forecast probability</option>
+      <option value="actual">Actual outcome</option>
+      <option value="correctness">Model correctness</option>
     </select>
   </div>
   <div class="row">
-    <label for="monthSel">Month</label>
+    <label for="monthRange">Month</label>
     <input id="monthRange" type="range" min="0" max="0" step="1" value="0"/>
-    <span id="monthLabel" class="pill">—</span>
-    <button id="playBtn">▶</button>
+    <span id="monthLabel">—</span>
+    <button id="playBtn" title="Play animation">▶</button>
   </div>
-  <div class="row"></div>
-  <div class="legend" id="legend"></div>
+  <div class="row">
+    <label><input type="checkbox" id="alertsOnly"/> Highlight alerts</label>
+  </div>
+  <div id="legend" class="legend"></div>
 </div>
 
-<!-- removed key panel; legend explains active metric -->
-
-<div class="footer">
-  <span id="metrics">No evaluation yet for this month.</span>
-</div>
+<div class="footer" id="metrics">Loading…</div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <script>
-let map, layer, months=[], monthIdx=0;
-let monthData = null;     // { sa2_code: {p: float|null, y: 0|1|null} }
-let summary = {};         // { "YYYY-MM": {auc,brier,base_rate,n_sa2} }
-const threshold = 0.5;    // default for footer metrics (kept)
-const threshold60 = 0.6;  // cutoff for "Correct @ 0.60" metric
+const THRESHOLDS = [{"id": "thr0p010", "label": "Rent rise ≥ 1%", "event_threshold": 0.01, "default": false}, {"id": "thr0p020", "label": "Rent rise ≥ 2%", "event_threshold": 0.02, "default": true}, {"id": "thr0p030", "label": "Rent rise ≥ 3%", "event_threshold": 0.03, "default": false}];
+const DEFAULT_THRESHOLD = {"id": "thr0p020", "label": "Rent rise ≥ 2%", "event_threshold": 0.02, "default": true};
+let currentThreshold = THRESHOLDS.length ? (THRESHOLDS.find(t => t.default) || THRESHOLDS[0]) : DEFAULT_THRESHOLD;
 
-function fmtPct(x) {
-  const v = Number.parseFloat(x);
-  if (!Number.isFinite(v)) return "—";
-  return (Math.round(v * 1000) / 10).toFixed(1) + "%";
-}
-function clamp(x,a,b){ return Math.max(a, Math.min(b, x)); }
+let map, layer;
+let months = [];
+let monthIdx = 0;
+let monthData = {};
+let summary = {};
+let latestActualIdx = null;
 
-function colorProb(p){ if(p==null || isNaN(p)) return "#d9d9d9";
-  const stops=[[0.0,"#ffffcc"],[0.2,"#ffeda0"],[0.4,"#feb24c"],[0.6,"#fd8d3c"],[0.8,"#f03b20"],[1.0,"#bd0026"]];
-  for(let i=1;i<stops.length;i++){ if(p<=stops[i][0]){
-    const t=(p-stops[i-1][0])/(stops[i][0]-stops[i-1][0]);
-    return lerpColor(stops[i-1][1],stops[i][1],t); } }
-  return stops[stops.length-1][1];
+let thresholdSelect, metricSelect, monthRange, alertsOnlyCb, playBtn, metricsEl;
+let playHandle = null;
+let currentMonthHasActual = false;
+
+function hasActualValues(data) {
+  if (!data) return false;
+  return Object.values(data).some(rec => rec && rec.y !== null && rec.y !== undefined);
 }
-function colorActual(y){ if(y==null) return "#d9d9d9"; return y? "#bd0026" : "#c7e9c0"; }
-function colorError(e){ if(e==null || isNaN(e)) return "#d9d9d9";
-  const v = clamp((e+1)/2,0,1);
-  const stops=[[0,"#2166ac"],[0.25,"#67a9cf"],[0.5,"#f7f7f7"],[0.75,"#ef8a62"],[1,"#b2182b"]];
-  for(let i=1;i<stops.length;i++){ if(v<=stops[i][0]){
-    const t=(v-stops[i-1][0])/(stops[i][0]-stops[i-1][0]);
-    return lerpColor(stops[i-1][1],stops[i][1],t); } }
-  return stops[stops.length-1][1];
+function eventThresholdLabel(value) {
+  const thr = Number.isFinite(value) ? value : (currentThreshold ? currentThreshold.event_threshold : DEFAULT_THRESHOLD.event_threshold);
+  const pct = thr * 100;
+  return (Math.abs(pct - Math.round(pct)) < 1e-6 ? Math.round(pct).toString() : pct.toFixed(1)) + '%';
 }
-function colorAbsErr(ae){ if(ae==null || isNaN(ae)) return "#d9d9d9";
-  const v=clamp(ae,0,1);
-  const stops=[[0,"#f7fcb9"],[0.33,"#addd8e"],[0.66,"#31a354"],[1,"#006837"]];
-  for(let i=1;i<stops.length;i++){ if(v<=stops[i][0]){
-    const t=(v-stops[i-1][0])/(stops[i][0]-stops[i-1][0]);
-    return lerpColor(stops[i-1][1],stops[i][1],t); } }
-  return stops[stops.length-1][1];
+function dataUrl(filename) {
+  const base = currentThreshold && currentThreshold.id ? currentThreshold.id : DEFAULT_THRESHOLD.id;
+  return `data/${base}/${filename}`;
 }
-function colorCorrect(correct){
-  if(correct==null) return "#d9d9d9";
-  return correct ? "#31a354" : "#ef3b2c"; // green for correct, red for incorrect
+function fmtPct(val, digits = 1) {
+  return Number.isFinite(val) ? (val * 100).toFixed(digits) + '%' : '—';
 }
-function colorConfusion(kind){
-  // kind: 'TP','TN','FP','FN', null -> grey
-  switch(kind){
-    case 'TP': return '#1a9850'; // dark green
-    case 'TN': return '#74add1'; // blue
-    case 'FP': return '#fdae61'; // orange
-    case 'FN': return '#d73027'; // red
-    default: return '#d9d9d9';
-  }
-}
+function fmtPct0(val) { return fmtPct(val, 0); }
+function fmtFloat(val, digits = 3) { return Number.isFinite(val) ? val.toFixed(digits) : '—'; }
+function fmtCount(val) { return Number.isFinite(val) ? String(Math.round(val)) : '—'; }
+function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
 function lerpColor(a,b,t){
-  const pa=parseInt(a.slice(1),16), pb=parseInt(b.slice(1),16);
-  const ar=(pa>>16)&0xff, ag=(pa>>8)&0xff, ab=pa&0xff;
-  const br=(pb>>16)&0xff, bg=(pb>>8)&0xff, bb=pb&0xff;
-  const r=Math.round(ar+(br-ar)*t), g=Math.round(ag+(bg-ag)*t), bl=Math.round(ab+(bb-ab)*t);
-  return "#"+((1<<24)+(r<<16)+(g<<8)+bl).toString(16).slice(1);
+  const pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16);
+  const ar = (pa >> 16) & 0xff, ag = (pa >> 8) & 0xff, ab = pa & 0xff;
+  const br = (pb >> 16) & 0xff, bg = (pb >> 8) & 0xff, bb = pb & 0xff;
+  const r = Math.round(ar + (br - ar) * t);
+  const g = Math.round(ag + (bg - ag) * t);
+  const blue = Math.round(ab + (bb - ab) * t);
+  return '#' + ((1 << 24) + (r << 16) + (g << 8) + blue).toString(16).slice(1);
+}
+function colorProb(p){ if(p==null || isNaN(p)) return '#d9d9d9';
+  const stops=[[0.0,'#ffffcc'],[0.2,'#ffeda0'],[0.4,'#feb24c'],[0.6,'#fd8d3c'],[0.8,'#f03b20'],[1.0,'#bd0026']];
+  for (let i=1;i<stops.length;i++){
+    if (p <= stops[i][0]){
+      const t = (p - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
+      return lerpColor(stops[i-1][1], stops[i][1], t);
+    }
+  }
+  return stops[stops.length-1][1];
+}
+function colorActual(y){ if(y==null) return '#d9d9d9'; return y ? '#d73027' : '#1a9850'; }
+function colorCorrect(isCorrect){
+  if(isCorrect == null) return '#d9d9d9';
+  return isCorrect ? '#31a354' : '#ef3b2c';
 }
 
 function setLegend(kind){
-  const el=document.getElementById("legend");
-  if(kind==="forecast"){
-    el.innerHTML = `<div><b>Forecast probability</b> (Pr[Δrent &gt; 2%])</div>
-      <div class="grad" style="height:10px;background:linear-gradient(to right,#ffffcc,#ffeda0,#feb24c,#fd8d3c,#f03b20,#bd0026)"></div>
+  const el = document.getElementById('legend');
+  if(!el) return;
+  const label = eventThresholdLabel();
+  if(kind === 'forecast'){
+    el.innerHTML = `<div><b>Forecast probability</b> (Pr[Δrent &gt; ${label}])</div>
+      <div class="grad" style="background:linear-gradient(to right,#ffffcc,#ffeda0,#feb24c,#fd8d3c,#f03b20,#bd0026)"></div>
       <div style="display:flex;justify-content:space-between;"><span>0</span><span>1</span></div>`;
-  } else if(kind==="actual"){
-    el.innerHTML = `<div><b>Actual outcome</b></div>
-      <div style="display:flex;gap:6px;align-items:center;">
-        <span style="display:inline-block;width:18px;height:12px;background:#bd0026;border:1px solid #999"></span> rise &gt; 2%
-        <span style="display:inline-block;width:18px;height:12px;background:#c7e9c0;border:1px solid #999;margin-left:10px;"></span> not rise
-        <span style="display:inline-block;width:18px;height:12px;background:#d9d9d9;border:1px solid #999;margin-left:10px;"></span> n/a
+  } else if(kind === 'actual'){
+    el.innerHTML = `<div><b>Actual outcome</b> (rise &gt; ${label})</div>
+      <div style="display:flex;flex-direction:column;gap:4px;margin-top:4px;">
+        <span><span class="swatch" style="background:#d73027"></span> Rise</span>
+        <span><span class="swatch" style="background:#1a9850"></span> No rise</span>
+        <span><span class="swatch" style="background:#d9d9d9"></span> Not yet known</span>
       </div>`;
-  } else if(kind==="correct60"){
-    el.innerHTML = `<div><b>Correct @ 0.60</b> (p ≥ 0.60 vs actual)</div>
-      <div style="display:flex;gap:6px;align-items:center;">
-        <span style="display:inline-block;width:18px;height:12px;background:#31a354;border:1px solid #999"></span> correct
-        <span style="display:inline-block;width:18px;height:12px;background:#ef3b2c;border:1px solid #999;margin-left:10px;"></span> incorrect
-        <span style="display:inline-block;width:18px;height:12px;background:#d9d9d9;border:1px solid #999;margin-left:10px;"></span> n/a
-      </div>`;
-  } else if(kind==="error"){
-    el.innerHTML = `<div><b>Error</b> (prob − actual)</div>
-      <div class="grad-div" style="height:10px;background:linear-gradient(to right,#2166ac,#67a9cf,#f7f7f7,#ef8a62,#b2182b)"></div>
-      <div style="display:flex;justify-content:space-between;"><span>-1</span><span>0</span><span>+1</span></div>`;
   } else {
-    if(kind==="abserr"){
-      el.innerHTML = `<div><b>Absolute error</b> |prob − actual|</div>
-        <div class="grad" style="height:10px;background:linear-gradient(to right,#f7fcb9,#addd8e,#31a354,#006837)"></div>
-        <div style="display:flex;justify-content:space-between;"><span>0</span><span>1</span></div>`;
-    }
+    el.innerHTML = `<div><b>Model correctness</b> (best operating threshold)</div>
+      <div style="display:flex;flex-direction:column;gap:4px;margin-top:4px;">
+        <span><span class="swatch" style="background:#31a354"></span> Model was correct</span>
+        <span><span class="swatch" style="background:#ef3b2c"></span> Model was incorrect</span>
+        <span><span class="swatch" style="background:#d9d9d9"></span> Not yet known</span>
+      </div>`;
   }
 }
 
 function styleFeature(feat){
   const code = feat.properties.sa2_code;
   const rec = monthData ? monthData[code] : null;
-  const metric = document.getElementById("metric").value;
-  let fill="#d9d9d9";
+  const metric = metricSelect ? metricSelect.value : 'forecast';
+  const alertsOnly = alertsOnlyCb ? alertsOnlyCb.checked : false;
+  let fill = '#d9d9d9';
   if(rec){
-    if(metric==="forecast") fill = colorProb(rec.p);
-    else if(metric==="actual") fill = colorActual(rec.y);
-    else if(metric==="correct60"){
-      const yhat = (rec.p==null) ? null : (rec.p >= threshold60 ? 1 : 0);
-      const ok = (rec.y==null || yhat==null) ? null : (yhat===rec.y);
-      fill = colorCorrect(ok);
-    }
-    else if(metric==="error"){
-      const e = (rec.p==null || rec.y==null) ? null : (rec.p - rec.y);
-      fill = colorError(e);
-    } else if(metric==="abserr"){
-      const ae = (rec.p==null || rec.y==null) ? null : Math.abs(rec.p - rec.y);
-      fill = colorAbsErr(ae);
-    }
+    if(metric === 'forecast') fill = colorProb(rec.p);
+    else if(metric === 'actual') fill = colorActual(rec.y);
+    else if(metric === 'correctness') fill = colorCorrect(rec.correct);
   }
-  return { fillColor: fill, color: "#666", weight: 0.4, fillOpacity: 0.85 };
+  if(alertsOnly && (!rec || rec.pred !== 1)){
+    return { fillColor: fill, color: '#666', weight: 0.0, fillOpacity: 0.0 };
+  }
+  return { fillColor: fill, color: '#666', weight: 0.4, fillOpacity: 0.85 };
 }
 
 function tooltipHTML(feat){
   const code = feat.properties.sa2_code;
-  const name = feat.properties.sa2_name || "";
+  const name = feat.properties.sa2_name || '';
   const rec = monthData ? monthData[code] : null;
-  const p = rec? rec.p : null, y = rec? rec.y : null;
-  const l = rec? rec.l : null, u = rec? rec.u : null;
-  const e = (p==null || y==null) ? null : (p - y);
-  const ae = (p==null || y==null) ? null : Math.abs(p - y);
-  const metric = document.getElementById("metric").value;
-  
+  const p = rec ? rec.p : null;
+  const y = rec ? rec.y : null;
+  const pred = rec ? rec.pred : null;
+  const correct = rec ? rec.correct : null;
+  const l = rec ? rec.l : null;
+  const u = rec ? rec.u : null;
   const ci = (l==null || u==null) ? '—' : `${fmtPct(l)} – ${fmtPct(u)}`;
-  let extra = '';
-  if(metric === 'correct60'){
-    extra = `
-          <p class="tooltip-line">Predicted (≥0.60): ${p==null? "—" : (p>=threshold60? "Raise":"No raise")}</p>
-          <p class="tooltip-line">Correct @0.60: ${(y==null || p==null) ? "—" : (((p>=threshold60?1:0)===y) ? "Yes" : "No")}</p>`;
-  }
+  const actualLabel = y == null ? 'Not yet known' : (y ? 'Yes' : 'No');
+  const predLabel = pred == null ? 'Not yet run' : (pred ? 'Raise' : 'No raise');
+  const correctLabel = correct == null ? 'Not yet known' : (correct ? 'Yes ✔' : 'No ✖');
+  const label = eventThresholdLabel();
   return `<p class="tooltip-line"><b>${name || code}</b></p>
           <p class="tooltip-line">SA2: ${code}</p>
           <p class="tooltip-line">Forecast: ${fmtPct(p)}</p>
           <p class="tooltip-line">90% CI: ${ci}</p>
-          <p class="tooltip-line">Actual rise &gt;2%: ${y==null? "—" : (y? "Yes":"No")}</p>${extra}
-          
-          <p class="tooltip-line">Error (p−y): ${e==null? "—" : (Math.round(e*1000)/1000)}</p>
-          <p class="tooltip-line">|Error|: ${ae==null? "—" : (Math.round(ae*1000)/1000)}</p>`;
+          <p class="tooltip-line">Actual rise &gt; ${label}: ${actualLabel}</p>
+          <p class="tooltip-line">Model prediction: ${predLabel}</p>
+          <p class="tooltip-line">Model correct: ${correctLabel}</p>`;
 }
 
-// Compute tooltip WHEN it opens (so it always uses the latest monthData)
-function onEachFeature(feat, l){
-  l.bindTooltip('', {sticky:true});
-  l.on('tooltipopen', (e) => { e.tooltip.setContent(tooltipHTML(feat)); });
-  l.on('mouseover', () => l.setStyle({weight: 2}));
-  l.on('mouseout',  () => l.setStyle({weight: 0.4}));
+function updateFooter(info, month){
+  if(!metricsEl) metricsEl = document.getElementById('metrics');
+  if(!metricsEl){ return; }
+  const label = eventThresholdLabel(info && info.event_threshold);
+  if(!info || !info.has_actual){
+    const count = info && Number.isFinite(info.n_sa2) ? info.n_sa2 : '—';
+    metricsEl.innerHTML = `<strong>${month}</strong>: Actual outcomes are not yet available. Forecasts cover ${count} suburbs (rent-rise threshold ${label}).`;
+    return;
+  }
+  const acc = fmtPct0(info.accuracy_at_thr);
+  const prec = fmtPct0(info.precision_at_thr);
+  const rec = fmtPct0(info.recall_at_thr);
+  const base = fmtPct0(info.base_rate);
+  const thr = fmtFloat(info.threshold, 3);
+  metricsEl.innerHTML = `<strong>${month}</strong>: Model was correct for ${acc} of suburbs (precision ${prec}, recall ${rec}). Base rent-rise rate ${base}; rent threshold ${label}. Best-F1 cutoff ${thr}.`;
 }
 
 async function loadMonth(idx){
-  const month = months[idx];
-  document.getElementById("monthLabel").textContent = month;
-  const res = await fetch(`data/${month}.json?ts=` + Date.now());
-  monthData = await res.json().catch(_=> (monthData=null));
+  if(!months.length){
+    monthIdx = 0;
+    if(monthRange) monthRange.value = '0';
+    const labelEl = document.getElementById('monthLabel');
+    if(labelEl) labelEl.textContent = '—';
+    monthData = {};
+    currentMonthHasActual = false;
+    updateFooter(null, '—');
+    if(layer) layer.setStyle(styleFeature);
+    setLegend(metricSelect ? metricSelect.value : 'forecast');
+    return;
+  }
+  monthIdx = Math.max(0, Math.min(idx, months.length-1));
+  const month = months[monthIdx];
+  if(monthRange) monthRange.value = String(monthIdx);
+  const labelEl = document.getElementById('monthLabel');
+  if(labelEl) labelEl.textContent = month;
+  try {
+    const monthUrl = dataUrl(`${month}.json`);
+    const res = await fetch(`${monthUrl}?ts=` + Date.now());
+    monthData = await res.json();
+  } catch (err) {
+    monthData = {};
+  }
+  currentMonthHasActual = hasActualValues(monthData);
+  const info = summary[month] || null;
+  updateFooter(info, month);
+  if(layer){
+    layer.setStyle(styleFeature);
+    layer.eachLayer(ln => {
+      const tt = ln.getTooltip && ln.getTooltip();
+      if(tt && ln.isTooltipOpen && ln.isTooltipOpen()){
+        tt.setContent(tooltipHTML(ln.feature));
+      }
+    });
+  }
+  const kind = metricSelect ? metricSelect.value : 'forecast';
+  if((kind === 'actual' || kind === 'correctness') && !currentMonthHasActual && latestActualIdx !== null){
+    metricSelect.value = 'forecast';
+    setLegend('forecast');
+  } else {
+    setLegend(kind);
+  }
+}
 
-  // Footer metrics
-  const m = summary[month] || {};
-  const el = document.getElementById("metrics");
-  const auc   = (typeof m.auc   === 'number' && Number.isFinite(m.auc))   ? m.auc.toFixed(3)   : '—';
-  const brier = (typeof m.brier === 'number' && Number.isFinite(m.brier)) ? m.brier.toFixed(3) : '—';
-  const base  = (typeof m.base_rate === 'number') ? (m.base_rate*100).toFixed(1)+'%' : '—';
-  const n     = (typeof m.n_sa2 === 'number') ? m.n_sa2 : '—';
-  const ll   = (typeof m.log_loss === 'number' && Number.isFinite(m.log_loss)) ? m.log_loss.toFixed(3) : '—';
-  const prec = (typeof m.precision_at_0_5 === 'number' && Number.isFinite(m.precision_at_0_5)) ? (m.precision_at_0_5*100).toFixed(0)+'%' : '—';
-  const rec  = (typeof m.recall_at_0_5 === 'number' && Number.isFinite(m.recall_at_0_5)) ? (m.recall_at_0_5*100).toFixed(0)+'%' : '—';
-  const acc  = (typeof m.accuracy_at_0_5 === 'number' && Number.isFinite(m.accuracy_at_0_5)) ? (m.accuracy_at_0_5*100).toFixed(0)+'%' : '—';
-  el.textContent = `AUC ${auc} | Brier ${brier} | LogLoss ${ll} | Precision ${prec} | Recall ${rec} | Accuracy ${acc} | Base rate ${base} | n=${n}`;
+function stopPlayback(){
+  if(playHandle){
+    clearInterval(playHandle);
+    playHandle = null;
+    if(playBtn) playBtn.textContent = '▶';
+  }
+}
 
-  // Repaint and refresh any open tooltips
-  layer.setStyle(styleFeature);
-  layer.eachLayer((ln) => {
-    const tt = ln.getTooltip && ln.getTooltip();
-    if (tt && ln.isTooltipOpen && ln.isTooltipOpen()) {
-      tt.setContent(tooltipHTML(ln.feature));
+async function loadThreshold(thresholdId, preferMonth = null){
+  stopPlayback();
+  const next = THRESHOLDS.find(t => t.id === thresholdId);
+  currentThreshold = next || DEFAULT_THRESHOLD;
+  if(thresholdSelect) thresholdSelect.value = currentThreshold.id;
+
+  try {
+    const monthsRes = await fetch(`${dataUrl('months.json')}?ts=${Date.now()}`);
+    const payload = await monthsRes.json();
+    months = Array.isArray(payload) ? payload : [];
+  } catch (err) {
+    months = [];
+  }
+
+  try {
+    const summaryRes = await fetch(`${dataUrl('summary.json')}?ts=${Date.now()}`);
+    summary = await summaryRes.json();
+  } catch (err) {
+    summary = {};
+  }
+
+  latestActualIdx = null;
+  for(let i=0; i<months.length; i++){
+    const info = summary[months[i]];
+    if(info && info.has_actual) latestActualIdx = i;
+  }
+
+  let defaultIdx = months.length ? months.length - 1 : 0;
+  if(latestActualIdx !== null) defaultIdx = latestActualIdx;
+  if(preferMonth){
+    const idx = months.indexOf(preferMonth);
+    if(idx >= 0) defaultIdx = idx;
+  }
+
+  if(monthRange){
+    monthRange.max = months.length ? String(months.length - 1) : '0';
+    monthRange.value = months.length ? String(defaultIdx) : '0';
+  }
+
+  if(months.length){
+    await loadMonth(defaultIdx);
+  } else {
+    monthIdx = 0;
+    if(monthRange) monthRange.value = '0';
+    const labelEl = document.getElementById('monthLabel');
+    if(labelEl) labelEl.textContent = '—';
+    monthData = {};
+    currentMonthHasActual = false;
+    updateFooter(null, '—');
+    if(layer) layer.setStyle(styleFeature);
+  }
+
+  if(metricSelect){
+    const info = months.length ? summary[months[Math.min(defaultIdx, months.length - 1)]] : null;
+    if(info && info.has_actual){
+      metricSelect.value = 'correctness';
+    } else {
+      metricSelect.value = 'forecast';
     }
-  });
+  }
+
+  setLegend(metricSelect ? metricSelect.value : 'forecast');
+  if(layer) layer.setStyle(styleFeature);
 }
 
 async function init(){
   map = L.map('map').setView([-31.95, 115.86], 5);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{ attribution: '&copy; OpenStreetMap' }).addTo(map);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
 
-  // Load months & summary (with cache-busting)
-  months  = await (await fetch('data/months.json?ts='  + Date.now())).json();
-  summary = await (await fetch('data/summary.json?ts=' + Date.now())).json().catch(_=> ({}));
+  thresholdSelect = document.getElementById('thresholdSelect');
+  metricSelect = document.getElementById('metric');
+  monthRange = document.getElementById('monthRange');
+  alertsOnlyCb = document.getElementById('alertsOnly');
+  playBtn = document.getElementById('playBtn');
+  metricsEl = document.getElementById('metrics');
 
-  // Month slider
-  const range = document.getElementById('monthRange');
-  range.max = String(Math.max(0, months.length-1));
-  range.value = String(Math.max(0, months.length-1));
-  document.getElementById('monthLabel').textContent = months.length? months[months.length-1] : '—';
-  range.addEventListener('input', e => loadMonth(parseInt(e.target.value,10)));
-
-  // Legend + metric changer
-  const metricSel = document.getElementById('metric');
-  setLegend(metricSel.value);
-  metricSel.addEventListener('change', () => {
-    setLegend(metricSel.value);
-    layer.setStyle(styleFeature);
-    // refresh any open tooltips to reflect new numbers/format
-    layer.eachLayer((ln) => {
-      const tt = ln.getTooltip && ln.getTooltip();
-      if (tt && ln.isTooltipOpen && ln.isTooltipOpen()) {
-        tt.setContent(tooltipHTML(ln.feature));
-      }
+  if(thresholdSelect){
+    thresholdSelect.innerHTML = '';
+    THRESHOLDS.forEach(spec => {
+      const opt = document.createElement('option');
+      opt.value = spec.id;
+      opt.textContent = spec.label || `Rent rise ≥ ${eventThresholdLabel(spec.event_threshold)}`;
+      thresholdSelect.appendChild(opt);
     });
-  });
-
-  // Key panel (optional UI) — guard missing DOM nodes
-  const keyBtn = document.getElementById('keyBtn');
-  const keyPanel = document.getElementById('keyPanel');
-  const keyClose = document.getElementById('keyClose');
-  if (keyBtn && keyPanel && keyClose) {
-    keyBtn.addEventListener('click', () => {
-      const t1 = document.getElementById('keyThr1');
-      const t2 = document.getElementById('keyThr2');
-      if (t1) t1.textContent = '@0.50';
-      if (t2) t2.textContent = '@0.50';
-      keyPanel.style.display = 'block';
+    if(!THRESHOLDS.length){
+      const opt = document.createElement('option');
+      opt.value = DEFAULT_THRESHOLD.id;
+      opt.textContent = DEFAULT_THRESHOLD.label || `Rent rise ≥ ${eventThresholdLabel(DEFAULT_THRESHOLD.event_threshold)}`;
+      thresholdSelect.appendChild(opt);
+    }
+    thresholdSelect.value = currentThreshold.id;
+    thresholdSelect.disabled = thresholdSelect.options.length <= 1;
+    thresholdSelect.addEventListener('change', async e => {
+      await loadThreshold(e.target.value, months[monthIdx] || null);
     });
-    keyClose.addEventListener('click', () => { keyPanel.style.display = 'none'; });
   }
 
-  // Play/pause
-  let playing=false, handle=null;
-  const btn = document.getElementById('playBtn');
-  btn.addEventListener('click', () => {
-    playing = !playing;
-    btn.textContent = playing ? "⏸" : "▶";
-    if(playing){
-      handle = setInterval(() => {
-        let i = parseInt(range.value,10);
-        i = (i+1) % months.length;
-        range.value = String(i);
-        loadMonth(i);
-      }, 1200);
-    } else {
-      clearInterval(handle);
-    }
-  });
+  if(monthRange){
+    monthRange.addEventListener('input', e => {
+      stopPlayback();
+      loadMonth(Number(e.target.value));
+    });
+  }
 
-  // Geometry layer (cache-busted)
+  if(metricSelect){
+    metricSelect.addEventListener('change', async () => {
+      const kind = metricSelect.value;
+      if((kind === 'actual' || kind === 'correctness') && !currentMonthHasActual && latestActualIdx !== null){
+        if(monthRange) monthRange.value = String(latestActualIdx);
+        await loadMonth(latestActualIdx);
+        metricSelect.value = kind;
+      }
+      setLegend(metricSelect.value);
+      if(layer){
+        layer.setStyle(styleFeature);
+      }
+    });
+  }
+
+  if(alertsOnlyCb){
+    alertsOnlyCb.addEventListener('change', () => {
+      if(layer) layer.setStyle(styleFeature);
+    });
+  }
+
+  if(playBtn){
+    playBtn.addEventListener('click', () => {
+      if(!months.length) return;
+      if(playHandle){
+        stopPlayback();
+      } else {
+        playBtn.textContent = '⏸';
+        playHandle = setInterval(() => {
+          let next = (Number(monthRange.value) + 1) % months.length;
+          monthRange.value = String(next);
+          loadMonth(next);
+        }, 1500);
+      }
+    });
+  }
+
   const geom = await (await fetch('sa2_wa_simplified.geojson?ts=' + Date.now())).json();
-  layer = L.geoJSON(geom, { style: styleFeature, onEachFeature }).addTo(map);
-
-  // First paint
-  if(months.length) await loadMonth(months.length-1);
+  layer = L.geoJSON(geom, {
+    style: styleFeature,
+    onEachFeature: (feat, ln) => {
+      ln.bindTooltip('', {sticky:true});
+      ln.on('tooltipopen', e => e.tooltip.setContent(tooltipHTML(feat)));
+      ln.on('mouseover', () => ln.setStyle({weight: 2}));
+      ln.on('mouseout', () => ln.setStyle({weight: 0.4}));
+    }
+  }).addTo(map);
+  await loadThreshold(currentThreshold.id);
 }
+
 init();
 </script>
 </body>

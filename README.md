@@ -26,6 +26,31 @@ make serve   # open http://localhost:8081
 > - `src/models/forecast.py` now auto-calibrates, emits full threshold sweeps to `outputs/evaluations/forecast_training_metrics.json`, and supports optional prior-shift + bias fixes.
 > - `src/data_ingest/external_signals.py` fetches RBA cash rates plus ABS unemployment/building approvals (via `curl`) so fresh macro signals land in `data_stage/external_signals.parquet` with lags for production.
 > - Validation/run utilities moved under `tools/` (`time_split_validate`, `backfill_forecast_history`, etc.) and the docs site JSON is regenerated monthly (`docs/data/2025-01.json`…`2025-09.json`).
+> - Performance & tooling: JAX samplers for forecast, one‑click presets, DuckDB helpers, and BLAS/JAX env files (see below).
+
+### Performance & Tooling (Sept 2025)
+
+- JAX samplers (forecast): `src/models/forecast.py` now supports `--sampler {pymc,blackjax,numpyro}`, `--target-accept`, and `--init`. Divergence count is printed after sampling.
+- One-click presets: `python -m src.cli one-click -- --preset {fast,balanced,heavy}` and `--refit-nowcast`.
+  - fast: cached nowcast, 1×200 samplers
+  - balanced (default): includes 2023 in train, 2×800, GBM+Bayes
+  - heavy: refits nowcast, BlackJAX, 4×1500, `target_accept=0.995`
+- Recency weighting: forecasts default to a 12-month half-life (`FORECAST_RECENCY_HALFLIFE`); pass `--no-recency-weights` in `src/models/forecast.py` or `tools/time_split_validate.py` to treat historical months uniformly.
+- Environments (BLAS/JAX ready):
+  - Conda/mamba: `environment.yml` → `mamba env create -f environment.yml && mamba activate wa-rental-pipeline`
+  - Pixi: `pixi.toml` → `pixi install` then `pixi run one_click`
+- DuckDB helper: `src/common/duck.py` with `scan_stage()` and `ddb_query()` for fast Parquet SQL over `data_stage/`.
+  - Example:
+    ```py
+    from src.common.duck import ddb_query, scan_stage
+    q = (
+        "SELECT month, AVG(price_pressure_prob) AS p "
+        "FROM " + scan_stage('price_pressure_forecast_sa2_history.parquet') + " "
+        "GROUP BY month ORDER BY month"
+    )
+    df = ddb_query(q)
+    ```
+  - Pipeline artifact: `python -m tools.duck_summary` writes `outputs/tables/wa_monthly_prob_summary.csv`.
 
 ## Table of contents
 
@@ -255,6 +280,39 @@ make alerts_top20 THR=0.30 MONTH=2025-09
 make alerts_best MONTH=2025-08
 ```
 
+### Multi-threshold accuracy (stacked pipeline)
+
+When you want the stacked GBM+Bayes workflow (time-split + calibration + bias correction) for several rent thresholds at once, run the time-split validator with a threshold grid. The new sampler guards auto-retry long runs until rank-based R-hat ≤ 1.01.
+
+```bash
+PYTENSOR_FLAGS="blas__ldflags=-L/usr/lib/x86_64-linux-gnu -lopenblas" \
+  .venv/bin/python -m tools.time_split_validate \
+    --train-start 2024-03 --train-end 2025-02 \
+    --val-start 2025-03   --val-end   2025-08 \
+    --threshold-grid 0.01 0.02 0.03 \
+    --draws 1200 --tune 1200 \
+    --chains 8 --cores 8 \
+    --recency-half-life 6 \
+    --with-external --extra-features --with-spatial \
+    --walk-forward \
+    --pymc-target-accept 0.995 \
+    --sampler-rhat-max 1.01 \
+    --sampler-retries 2 \
+    --retry-draw-multiplier 1.5
+```
+
+The command writes `data_stage/price_pressure_forecast_sa2_history_thr0p010.parquet`, `..._thr0p020.parquet`, and `..._thr0p030.parquet`. Score each history (and regenerate spreadsheets) with:
+
+```bash
+.venv/bin/python -m src.reporting.evaluate_forecasts --threshold 0.01
+.venv/bin/python -m src.reporting.evaluate_forecasts --threshold 0.02
+.venv/bin/python -m src.reporting.evaluate_forecasts --threshold 0.03
+```
+
+Tip: on machines with ≥16 cores, either keep `--chains 8 --cores 8` or launch the thresholds in parallel shells so the sampler saturates more CPU.
+
+See also: [September 2025 threshold diff](docs/data/2025-09_threshold_diff.md) for side-by-side comparisons of the original 2 % release versus the new 1 %/2 %/3 % runs.
+
 ### Operational guidance
 
 - Thresholds: use the per‑month `best_thr_f1` from `outputs/evaluations/forecast_eval_summary.csv` for alerts instead of a fixed 0.50. The site and JSON exports include these alerts.
@@ -288,9 +346,10 @@ make alerts_best MONTH=2025-08
 - `outputs/reports/map_price_pressure.html` – Interactive SA2 map (fast, simplified geometries).  
 - `outputs/figures/top20_pressure_risers.png` – Static bar chart (top‑20).  
 - **After actuals exist** (next month):  
-  - `outputs/evaluations/forecast_eval_summary.csv` – AUC, Brier, log‑loss by month.  
-  - `outputs/evaluations/forecast_eval_details_YYYY‑MM.csv` – Row‑level truth vs prob.  
-  - `outputs/evaluations/forecast_calibration_YYYY‑MM.csv` & `outputs/figures/forecast_calibration_YYYY‑MM.png`.
+- `outputs/evaluations/forecast_eval_summary.csv` – AUC, Brier, log-loss by month.  
+- `outputs/evaluations/forecast_eval_details_YYYY‑MM.csv` – Row-level truth vs prob.  
+- `outputs/evaluations/forecast_calibration_YYYY‑MM.csv` & `outputs/figures/forecast_calibration_YYYY‑MM.png`.
+- `outputs/evaluations/forecast_calibration_clusters.csv` – calibration summary by price-based cluster (model-derived quintiles).
 
 **Interpretation**: A value of **0.82** means an **82%** chance that next month’s median rent for that SA2 rises by **> 2%**.
 
@@ -407,9 +466,11 @@ python -m src.reporting.build_site
 # Produces:
 # docs/index.html
 # docs/sa2_wa_simplified.geojson
-# docs/data/months.json
-# docs/data/YYYY-MM.json (per-month)
-# docs/summary.json (metrics per month once actuals exist)
+# docs/data/thresholds.json
+# docs/data/<threshold_id>/months.json
+# docs/data/<threshold_id>/YYYY-MM.json (per-month payloads)
+# docs/data/<threshold_id>/summary.json (metrics per month once actuals exist)
+# docs/data/months.json + docs/data/summary.json (legacy copies for the default threshold)
 ```
 
 You can open locally:
@@ -442,15 +503,15 @@ Optional `docs/_headers` (cache hints):
   Cache-Control: public, max-age=3600
 ```
 
-### Map metrics & legend
+### Map thresholds, metrics & legend
 
-- Forecast probability: colors interpolate from light yellow (0) to deep red (1) to show Pr[Δrent > 2%].
-- Actual outcome: red = rise > 2%, green = not rise, grey = n/a (no realized data yet).
-- Correct @ 0.60: uses a 0.60 cutoff to classify a “predicted raise” (prob ≥ 0.60). Green = prediction matches actual; red = prediction does not match; grey = n/a. This cutoff is visualization‑only.
-- Error (prob − actual): blue (negative) → grey (0) → red (positive) diverging scale.
-- Abs. error |prob − actual|: light to dark green with higher values darker.
+- Event threshold selector: choose between the 1 %, 2 %, and 3 % rent-jump definitions that we evaluate in walk-forward validation. The default view is ≥ 2 % to match production.
+- Forecast probability: colors interpolate from light yellow (0) to deep red (1) to show Pr[Δrent > selected threshold].
+- Actual outcome: red = rise above the threshold, green = not rise, grey = n/a (no realized data yet).
+- Model correctness: uses the per-month best-F1 probability cutoff surfaced in `summary.json`; green = prediction matches actual, red = mismatch, grey = n/a. This replaces the earlier fixed 0.60 cutoff.
+- Error (prob − actual) and |prob − actual| views remain available for quick calibration sweeps.
 
-Note: summary metrics in the footer (precision/recall/accuracy) are computed at a 0.50 threshold and are not affected by the “Correct @ 0.60” view.
+Note: footer metrics (precision/recall/accuracy) reflect the same best-F1 operating threshold that drives the correctness view. Accuracy at the legacy 0.50 cutoff is still exported in the summary JSON for tooling that needs it.
 
 ### Validation options (quick wins)
 
@@ -510,6 +571,8 @@ Cron tips:
 
 - **Map speed**: geometries are simplified in meters for the folium map and for the static site; increase the tolerance for smaller files.  
 - **Sampling speed**: consider a Conda/Mamba environment for optimized BLAS; or reduce `draws`/`tune` for dev runs.
+- **Sampler guard rails**: `tools.time_split_validate` and `src.models.forecast` accept `--sampler-rhat-max`, `--sampler-retries`, and `--retry-draw-multiplier` so long runs automatically re-sample until rank R-hat drops beneath the tolerance (default 1.01).
+- **CPU saturation**: raise `--chains`/`--cores` (e.g., 8×) or launch thresholds in parallel shells when running the multi-threshold grid so PyMC fills more cores.  
 - **Run‑time knobs** (safe defaults in code): `draws=1000`, `tune=1000`, `chains=4`, `target_accept=0.95`.
 
 ---
