@@ -540,6 +540,14 @@ python -m tools.time_split_validate \
 Neighbor feature details:
 - `nbr_availability_rate` is the mean of neighboring SA2s’ `availability_rate` for the same month (queen adjacency).
 - Uses the same‑month availability from the nowcast/prediction for base months, so there’s no label leakage.
+
+### TODO: Precision & Recall Enhancements
+
+- **Threshold tuning:** Explore per-month or per-segment operating thresholds (e.g., percentile-based cuts, cost-sensitive Fβ) beyond the current global best-F1 selection.
+- **Feature enrichment:** Prototype additional supply-demand features (vacancy data, time-on-market proxies, listings velocity) that could lift recall without sacrificing precision.
+- **Calibration audits:** Re-run isotonic/Platt calibration sweeps on the longer training window to reduce mid-probability overconfidence visible in calibration plots.
+- **Ensemble blending:** Evaluate stacking strategies that weight GBM vs Bayesian components differently for low-prevalence months to recover missed positives.
+- **Label quality checks:** Investigate rent-change volatility around reporting cutoffs (e.g., end-of-quarter effects) to ensure the 1 %/2 %/3 % labels aren’t introducing noise that caps precision.
 - Build adjacency once with `python -m tools.spatial_features` or let the validator auto‑create it on first run.
 
 ---

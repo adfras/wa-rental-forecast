@@ -23,8 +23,15 @@ def build_design():
     df = pd.read_parquet(STAGE_DIR / "bonds_panel_sa2.parquet").copy()
     return prepare_design(df)
 
-def fit_nowcast(draws: int = 1000, tune: int = 1000, chains: int = 4, cores: int = 4,
-                recency_half_life: float | None = None):
+def fit_nowcast(
+    draws: int = 1000,
+    tune: int = 1000,
+    chains: int = 4,
+    cores: int = 4,
+    recency_half_life: float | None = None,
+    target_accept: float = 0.98,
+    max_treedepth: int = 15,
+):
     """Fit the NB nowcast and write availability rate parquet.
 
     Returns the InferenceData object for optional diagnostics.
@@ -57,8 +64,8 @@ def fit_nowcast(draws: int = 1000, tune: int = 1000, chains: int = 4, cores: int
         season_raw = pm.Normal("season_raw", 0.0, 1.0, shape=12)
         season_eff = pm.Deterministic("season_eff", season_raw - pm.math.mean(season_raw))
 
-        # Overdispersion
-        alpha_nb = pm.HalfNormal("alpha_nb", 1.5)
+        # Overdispersion (slightly tighter prior to improve geometry)
+        alpha_nb = pm.HalfNormal("alpha_nb", 1.0)
 
         # Linear predictor with offset
         eta = a_sa2[sa2_idx] + beta_t * t + season_eff[season] + log_stock
@@ -71,8 +78,14 @@ def fit_nowcast(draws: int = 1000, tune: int = 1000, chains: int = 4, cores: int
             pm.Potential("weighted_loglik_nb", (w * pm.logp(y_dist, y)).sum())
 
         idata = pm.sample(
-            draws=draws, tune=tune, chains=chains, cores=cores, target_accept=0.95,
-            random_seed=RANDOM_SEED, progressbar=True
+            draws=draws,
+            tune=tune,
+            chains=chains,
+            cores=cores,
+            target_accept=target_accept,
+            step=pm.NUTS(max_treedepth=max_treedepth),
+            random_seed=RANDOM_SEED,
+            progressbar=True,
         )
 
     # Posterior mean of mu per observation (chain, draw, obs) → (obs,)
@@ -94,6 +107,17 @@ if __name__ == "__main__":
     ap.add_argument("--cores", type=int, default=4)
     ap.add_argument("--recency-half-life", type=float, default=None,
                     help="Half-life in months for sample recency weights (e.g., 12 → 50% per year older)")
+    ap.add_argument("--target-accept", type=float, default=0.98,
+                    help="Target acceptance rate for NUTS (default 0.98)")
+    ap.add_argument("--max-treedepth", type=int, default=15,
+                    help="Maximum tree depth for NUTS (default 15)")
     args = ap.parse_args()
-    fit_nowcast(draws=args.draws, tune=args.tune, chains=args.chains, cores=args.cores,
-                recency_half_life=args.recency_half_life)
+    fit_nowcast(
+        draws=args.draws,
+        tune=args.tune,
+        chains=args.chains,
+        cores=args.cores,
+        recency_half_life=args.recency_half_life,
+        target_accept=args.target_accept,
+        max_treedepth=args.max_treedepth,
+    )

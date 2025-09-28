@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -85,9 +86,16 @@ def _brier_decompose(y: np.ndarray, p: np.ndarray, bins: int = 10) -> tuple[floa
     acc = d["actual"].to_numpy().astype(float)
     conf = d["pred"].to_numpy().astype(float)
     reliability = float(np.sum(w * (conf - acc) ** 2) / wsum)
-    resolution  = float(np.sum(w * (acc - pi) ** 2) / wsum)
+    resolution = float(np.sum(w * (acc - pi) ** 2) / wsum)
     uncertainty = float(pi * (1 - pi))
     return reliability, resolution, uncertainty
+
+
+def _threshold_suffix(threshold: float) -> str:
+    formatted = f"{threshold:.3f}".rstrip("0").rstrip(".")
+    if not formatted:
+        formatted = "0"
+    return f"thr{formatted.replace('.', 'p')}"
 
 def _prc_metrics(y: np.ndarray, p: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
     try:
@@ -97,6 +105,23 @@ def _prc_metrics(y: np.ndarray, p: np.ndarray) -> tuple[float, np.ndarray, np.nd
         return ap, rec, prec
     except Exception:
         return float("nan"), np.array([]), np.array([])
+
+def _latest_hp_on_or_before(hp: pd.DataFrame, month: pd.Timestamp) -> pd.DataFrame:
+    """Return per-SA2 latest house-price record with hp.month <= month.
+
+    If none exist for any SA2, returns the overall latest per-SA2 record.
+    Expects columns: sa2_code, month, median_house_price (plus optional
+    price_allocation_weight_sum, price_suburb_count).
+    """
+    if hp.empty:
+        return hp
+    hp = hp.copy()
+    hp["month"] = to_month(hp["month"])  # ensure Timestamp
+    sub = hp[hp["month"] <= month].copy()
+    if sub.empty:
+        sub = hp.copy()
+    sub = sub.sort_values(["sa2_code", "month"]).groupby("sa2_code", as_index=False).tail(1)
+    return sub[["sa2_code", "median_house_price", "month"]]
 
 # -------------------- labels from realized rents --------------------
 
@@ -154,12 +179,62 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD,
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1) Predictions — prefer full history if available
-    hist_path = STAGE_DIR / "price_pressure_forecast_sa2_history.parquet"
-    preds_path = hist_path if hist_path.exists() else (STAGE_DIR / "price_pressure_forecast_sa2.parquet")
+    # 1) Predictions — prefer full history if available (suffix-aware)
+    suffix = None if math.isclose(threshold, RENT_GROWTH_THRESHOLD) else _threshold_suffix(threshold)
+
+    hist_candidates: list[Path] = []
+    if suffix:
+        hist_candidates.append(STAGE_DIR / f"price_pressure_forecast_sa2_history_{suffix}.parquet")
+    hist_candidates.append(STAGE_DIR / "price_pressure_forecast_sa2_history.parquet")
+
+    preds_path: Path | None = next((p for p in hist_candidates if p.exists()), None)
+    latest_candidates: list[Path] = []
+    if suffix:
+        latest_candidates.append(STAGE_DIR / f"price_pressure_forecast_sa2_{suffix}.parquet")
+    latest_candidates.append(STAGE_DIR / "price_pressure_forecast_sa2.parquet")
+    if preds_path is None:
+        preds_path = next((p for p in latest_candidates if p.exists()), latest_candidates[-1])
+
     preds = pd.read_parquet(preds_path).copy()
     preds["month"] = to_month(preds["month"])
     preds["sa2_code"] = preds["sa2_code"].astype(str)
+    if "rent_jump_threshold" in preds.columns:
+        preds = preds[np.isclose(preds["rent_jump_threshold"].astype(float), float(threshold))].copy()
+        if preds.empty:
+            raise SystemExit(f"No predictions found for threshold={threshold:.3f} in {preds_path}.")
+    else:
+        preds["rent_jump_threshold"] = float(threshold)
+
+    # Price clusters: prefer stored values, otherwise derive from latest house price snapshots
+    if "price_cluster" in preds.columns:
+        preds["price_cluster"] = preds["price_cluster"].fillna(-1).astype(int)
+    else:
+        preds["price_cluster"] = -1
+
+    hp_monthly_path = Path(STAGE_DIR / "house_prices_sa2_monthly.parquet")
+    hp_snapshot_path = Path(STAGE_DIR / "house_prices_sa2_snapshot.parquet")
+    hp_df: pd.DataFrame | None = None
+    if hp_monthly_path.exists():
+        hp_df = pd.read_parquet(hp_monthly_path).copy()
+    elif hp_snapshot_path.exists():
+        hp_df = pd.read_parquet(hp_snapshot_path).copy()
+    if hp_df is not None and not hp_df.empty:
+        if "median_house_price" in hp_df.columns:
+            hp_df["sa2_code"] = hp_df["sa2_code"].astype(str)
+            hp_df["month"] = to_month(hp_df["month"])
+            price_levels = (
+                hp_df.groupby("sa2_code")["median_house_price"].mean()
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna()
+            )
+            if not price_levels.empty:
+                q = min(5, price_levels.nunique())
+                if q >= 2:
+                    cluster_series = pd.qcut(price_levels, q=q, labels=False, duplicates="drop")
+                    cluster_map = cluster_series.astype(int).to_dict()
+                else:
+                    cluster_map = {code: 0 for code in price_levels.index}
+                preds.loc[:, "price_cluster"] = preds["sa2_code"].map(cluster_map).fillna(preds["price_cluster"]).astype(int)
 
     # Optional month window filter (inclusive)
     if start or end:
@@ -169,17 +244,18 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD,
 
     latest_month = preds["month"].max()
     latest = preds.loc[preds["month"] == latest_month].copy()
+    latest_suffix = "" if suffix is None else f"_{suffix}"
     latest.sort_values("price_pressure_prob", ascending=False).to_excel(
-        OUT_DIR / "price_pressure_forecast_sa2_latest.xlsx", index=False
+        OUT_DIR / f"price_pressure_forecast_sa2_latest{latest_suffix}.xlsx", index=False
     )
 
     # Named version (join SA2 names from ASGS)
     names = _read_sa2_names()   # sa2_code, optional sa2_name
     named = latest.merge(names, on="sa2_code", how="left")
     cols = ["sa2_code"] + (["sa2_name"] if "sa2_name" in named.columns else []) + ["month", "price_pressure_prob"]
-    named[cols].to_excel(OUT_DIR / "price_pressure_forecast_sa2_latest_named.xlsx", index=False)
-    print(f"Wrote {OUT_DIR / 'price_pressure_forecast_sa2_latest.xlsx'}")
-    print(f"Wrote {OUT_DIR / 'price_pressure_forecast_sa2_latest_named.xlsx'} ({len(named)} rows for {latest_month:%Y-%m}).")
+    named[cols].to_excel(OUT_DIR / f"price_pressure_forecast_sa2_latest_named{latest_suffix}.xlsx", index=False)
+    print(f"Wrote {OUT_DIR / ('price_pressure_forecast_sa2_latest' + latest_suffix + '.xlsx')}")
+    print(f"Wrote {OUT_DIR / ('price_pressure_forecast_sa2_latest_named' + latest_suffix + '.xlsx')} ({len(named)} rows for {latest_month:%Y-%m}).")
 
     # 2) Score predictions where realized outcomes exist
     labels = _build_realized_labels_v2(threshold)
@@ -189,9 +265,46 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD,
         print("No realized months yet to score. (Run again once the next bond ZIP is ingested.)")
         return
 
+    if "price_cluster" not in joined.columns:
+        joined["price_cluster"] = -1
+
     # Summary metrics per month (over all months with realized labels)
     summary_rows = []
     per_month_groups = list(joined.groupby("month"))
+
+    cluster_calibration_rows = []
+    realized_clusters = joined.dropna(subset=["actual_jump"]).copy()
+    if not realized_clusters.empty:
+        realized_clusters["price_cluster"] = realized_clusters["price_cluster"].fillna(-1).astype(int)
+        for (m, cluster), dfc in realized_clusters.groupby(["month", "price_cluster"], sort=True):
+            actual = dfc["actual_jump"].astype(int).to_numpy()
+            probs = dfc["price_pressure_prob"].astype(float).to_numpy()
+            if not len(probs):
+                continue
+            cluster_calibration_rows.append({
+                "month": pd.Timestamp(m),
+                "price_cluster": int(cluster),
+                "count": int(len(probs)),
+                "actual_rate": float(actual.mean()),
+                "predicted_mean": float(probs.mean()),
+                "calibration_gap": float(probs.mean() - actual.mean()),
+                "brier": float(np.mean((probs - actual) ** 2)),
+            })
+
+    # Optional house prices snapshot by SA2
+    if hp_df is not None:
+        rename_cols = {}
+        if "allocation_weight_sum" in hp_df.columns:
+            rename_cols["allocation_weight_sum"] = "price_allocation_weight_sum"
+        if "n_suburbs" in hp_df.columns:
+            rename_cols["n_suburbs"] = "price_suburb_count"
+        if rename_cols:
+            hp_df = hp_df.rename(columns=rename_cols)
+        keep_cols = [c for c in ["sa2_code", "month", "median_house_price", "price_allocation_weight_sum", "price_suburb_count"] if c in hp_df.columns]
+        hp_df = hp_df[keep_cols].copy()
+        hp_df["sa2_code"] = hp_df["sa2_code"].astype(str)
+        hp_df["month"] = to_month(hp_df["month"])  # normalize
+    K_LIST = [10, 20, 50, 100]
     for m, dfm in per_month_groups:
         y = dfm["actual_jump"].astype(int).to_numpy()
         p = dfm["price_pressure_prob"].astype(float).to_numpy()
@@ -294,10 +407,35 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD,
         ece = _ece(y, p, bins=10)
         rel, res, unc = _brier_decompose(y, p, bins=10)
 
-        summary_rows.append({
+        # House-price correlation (Spearman via rank correlation), if available
+        hp_corr = float("nan"); hp_n = 0
+        if hp_df is not None and not hp_df.empty:
+            hp_latest = _latest_hp_on_or_before(hp_df, m)
+            d2 = dfm.merge(hp_latest[["sa2_code", "median_house_price"]], on="sa2_code", how="left")
+            d2 = d2.dropna(subset=["median_house_price"]).copy()
+            if len(d2) >= 10:
+                hp_n = int(len(d2))
+                hp_corr = float(d2["price_pressure_prob"].rank().corr(d2["median_house_price"].rank()))
+
+        # Precision@K and lift@K
+        base_rate = float(y.mean())
+        topk = dfm.sort_values("price_pressure_prob", ascending=False).reset_index(drop=True)
+        prec_at_k = {}
+        lift_at_k = {}
+        pos_at_k = {}
+        for K in K_LIST:
+            if len(topk) >= K:
+                pos_k = int(topk.iloc[:K]["actual_jump"].astype(bool).sum())
+                prec_k = float(pos_k / K)
+                lift_k = float(prec_k / base_rate) if base_rate > 0 else np.nan
+                prec_at_k[f"precision_at_{K}"] = prec_k
+                lift_at_k[f"lift_at_{K}"] = lift_k
+                pos_at_k[f"positives_in_top_{K}"] = pos_k
+
+        row = {
             "month": m,
             "n_sa2": len(dfm),
-            "base_rate": float(y.mean()),
+            "base_rate": base_rate,
             "auc": _roc_auc(y, p),
             "brier": _brier(y, p),
             "log_loss": _log_loss(y, p),
@@ -328,13 +466,27 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD,
             "brier_reliability": rel,
             "brier_resolution": res,
             "brier_uncertainty": unc,
-
-        })
+            # House prices
+            "hp_corr_spearman": hp_corr,
+            "hp_n": hp_n,
+        }
+        # Merge P@K/lift counters
+        row.update(prec_at_k); row.update(lift_at_k); row.update(pos_at_k)
+        summary_rows.append(row)
 
     summary = pd.DataFrame(summary_rows).sort_values("month")
     summary_path = EVAL_DIR / "forecast_eval_summary.csv"
     summary.to_csv(summary_path, index=False)
     print(f"Wrote {summary_path}")
+
+    if cluster_calibration_rows:
+        cluster_df = pd.DataFrame(cluster_calibration_rows)
+        if pd.api.types.is_datetime64_any_dtype(cluster_df["month"]):
+            cluster_df["month"] = cluster_df["month"].dt.to_period("M").astype(str)
+        cluster_df.sort_values(["month", "price_cluster"], inplace=True)
+        cluster_csv = EVAL_DIR / "forecast_calibration_clusters.csv"
+        cluster_df.to_csv(cluster_csv, index=False)
+        print(f"Wrote {cluster_csv}")
 
     # 3) Detailed & calibration for each scored month
     for m, dfm in per_month_groups:
@@ -378,6 +530,21 @@ def main(threshold: float = RENT_GROWTH_THRESHOLD,
             pr_png = FIG_DIR / f"forecast_pr_curve_{m:%Y-%m}.png"
             fig2.tight_layout(); fig2.savefig(pr_png, dpi=160); plt.close(fig2)
             print(f"Wrote {pr_png}")
+
+        # Optional: scatter rent-risk vs house price (if snapshot exists)
+        if hp_df is not None and not hp_df.empty:
+            hp_latest = _latest_hp_on_or_before(hp_df, m)
+            d3 = detail.merge(hp_latest[["sa2_code", "median_house_price"]], on="sa2_code", how="left").dropna(subset=["median_house_price"]).copy()
+            if len(d3) >= 10:
+                fig3, ax3 = plt.subplots(figsize=(6,5))
+                ax3.scatter(d3["median_house_price"], d3["price_pressure_prob"], s=10, alpha=0.6)
+                ax3.set_xlabel("Median house price (latest on/before month)")
+                ax3.set_ylabel("Rent rise probability")
+                ax3.set_title(f"Rent risk vs house price — {m:%Y-%m}")
+                fig3.tight_layout()
+                scat_png = FIG_DIR / f"rent_vs_houseprice_{m:%Y-%m}.png"
+                fig3.savefig(scat_png, dpi=160); plt.close(fig3)
+                print(f"Wrote {scat_png}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate forecast accuracy; optionally filter months.")

@@ -3,21 +3,28 @@ Fetch or load external monthly signals to augment forecast features.
 
 - RBA cash rate target: programmatic fetch from the RBA page (parse tables).
 - ABS/other APIs: optional SDMX‑JSON or CSV URLs via env vars for WA
-  unemployment and building approvals.
-- CSV fallbacks: user‑supplied files under data_raw/external/.
+  unemployment, building approvals, and Perth CPI.
+- CoreLogic / other rent indexes: optional CSV URL or local CSV fallback.
+- CSV fallbacks: user-supplied files under data_raw/external/.
 
-Writes a single parquet: data_stage/external_signals.parquet with columns:
-  month (Timestamp), rba_cash_rate, wa_unemp_rate_sa, wa_build_approvals_num
+Writes `data_stage/external_signals.parquet` with columns such as:
+  month, rba_cash_rate, wa_unemp_rate_sa, wa_build_approvals_num,
+  perth_cpi, perth_cpi_sa, perth_rent_index, perth_rent_index_sa (columns
+  present depend on available data).
 
-API usage (optional): set environment variables to use official endpoints
-without manual CSVs.
-- ABS_UNEMPLOYMENT_SDMX_URL   → SDMX‑JSON endpoint for WA unemployment rate
-- ABS_BUILDAPP_SDMX_URL       → SDMX‑JSON endpoint for WA building approvals
-- UNEMPLOYMENT_CSV_URL        → direct CSV URL (alt to SDMX)
-- BUILDING_APPROVALS_CSV_URL  → direct CSV URL (alt to SDMX)
+Environment variables (optional):
+- RBA_CASHRATE_CSV_URL          → direct CSV for cash rate target
+- ABS_UNEMPLOYMENT_SDMX_URL     → SDMX JSON endpoint for WA unemployment
+- ABS_BUILDAPP_SDMX_URL         → SDMX JSON endpoint for WA building approvals
+- ABS_PERTH_CPI_SDMX_URL        → SDMX JSON endpoint for Perth CPI (All groups)
+- UNEMPLOYMENT_CSV_URL          → fallback CSV for WA unemployment
+- BUILDING_APPROVALS_CSV_URL    → fallback CSV for WA building approvals
+- PERTH_CPI_CSV_URL             → fallback CSV for Perth CPI
+- PERTH_RENT_INDEX_CSV_URL      → CSV for Perth/CoreLogic rent index (or local)
+- CORELOGIC_RENT_CSV_URL        → alias for rent index CSV (takes precedence)
 
 If neither SDMX nor CSV URLs are provided, the loader falls back to CSVs
-in data_raw/external/ (empty CSVs are ignored).
+in `data_raw/external/` (files may be empty; they will be ignored).
 """
 from __future__ import annotations
 
@@ -122,6 +129,56 @@ def fetch_rba_cash_rate() -> pd.DataFrame:
     out["month"] = to_month(out["date"], errors="coerce")  # normalize to month
     out = out.dropna(subset=["month"]).drop_duplicates(subset=["month"], keep="last")
     return out[["month", "rba_cash_rate"]].sort_values("month").reset_index(drop=True)
+
+
+def fetch_google_trends() -> pd.DataFrame:
+    """Fetch Google Trends interest for rental-related queries in WA and resample monthly.
+
+    Returns columns: month, gt_rent_intent, gt_vacancy_intent (normalized 0-1).
+    Silently returns an empty frame if pytrends is unavailable or rate-limited.
+    """
+    try:
+        from pytrends.request import TrendReq
+    except Exception:
+        return pd.DataFrame(columns=["month", "gt_rent_intent", "gt_vacancy_intent"]).astype({"month": "datetime64[ns]"})
+
+    geo = os.getenv("GT_GEO", "AU-WA")
+    # default from 2018 to today to match current model horizon
+    timeframe = os.getenv("GT_TIMEFRAME", f"2018-01-01 {pd.Timestamp.today().strftime('%Y-%m-%d')}")
+    rent_kw = [k.strip() for k in os.getenv("GT_RENT_KW", "rent,rental,house for rent").split(',') if k.strip()]
+    vac_kw  = [k.strip() for k in os.getenv("GT_VACANCY_KW", "rental vacancy,vacancy rate").split(',') if k.strip()]
+
+    def _pull(keywords: list[str]) -> pd.DataFrame:
+        if not keywords:
+            return pd.DataFrame(columns=["month", "value"]).astype({"month": "datetime64[ns]"})
+        try:
+            tr = TrendReq(hl="en-US", tz=600)
+            tr.build_payload(keywords, geo=geo, timeframe=timeframe)
+            df = tr.interest_over_time()
+            if df is None or df.empty:
+                return pd.DataFrame(columns=["month", "value"]).astype({"month": "datetime64[ns]"})
+            df = df.drop(columns=[c for c in df.columns if c == "isPartial"], errors="ignore")
+            vals = df.sum(axis=1)
+            out = vals.to_frame("value").reset_index().rename(columns={"date": "date"})
+            out["month"] = pd.to_datetime(out["date"]).dt.to_period("M").dt.to_timestamp()
+            out = out.groupby("month", as_index=False)["value"].mean()
+            out["value"] = out["value"].astype(float)
+            return out[["month", "value"]]
+        except Exception:
+            return pd.DataFrame(columns=["month", "value"]).astype({"month": "datetime64[ns]"})
+
+    rent = _pull(rent_kw).rename(columns={"value": "gt_rent_intent"})
+    vac  = _pull(vac_kw).rename(columns={"value": "gt_vacancy_intent"})
+    if rent.empty and vac.empty:
+        return pd.DataFrame(columns=["month", "gt_rent_intent", "gt_vacancy_intent"]).astype({"month": "datetime64[ns]"})
+    df = rent.merge(vac, on="month", how="outer").sort_values("month")
+    # normalize each column 0-1 for stability across refetches
+    for c in ["gt_rent_intent", "gt_vacancy_intent"]:
+        if c in df:
+            s = df[c].astype(float)
+            rng = (s.max() - s.min()) or 1.0
+            df[c] = (s - s.min()) / rng
+    return df
 
 
 def _fetch_csv_url(url: str, month_col: str = "month", value_col: str = "value",
@@ -381,6 +438,14 @@ def main() -> None:
     if not rba_csv.empty:
         pieces.append(rba_csv)
 
+    # Google Trends rental search intent (optional)
+    try:
+        gt = fetch_google_trends()
+        if not gt.empty:
+            pieces.append(gt)
+    except Exception:
+        pass
+
     # 2) WA unemployment — prefer API if provided, else ABS curl helper, else CSV fallback
     unemp_df = pd.DataFrame(columns=["month", "wa_unemp_rate_sa"])
     unemp_sdmx = os.getenv("ABS_UNEMPLOYMENT_SDMX_URL")
@@ -422,7 +487,7 @@ def main() -> None:
 
     if appr_df.empty:
         dataflow = os.getenv("ABS_BUILDAPP_DATAFLOW", "BA_GCCSA")
-        key = os.getenv("ABS_BUILDAPP_KEY", "1.1.9.TOT.TOT.10.5.M")
+        key = os.getenv("ABS_BUILDAPP_KEY", "1.1.9.TOT.TOT.10.5GPER.M")
         start_period = os.getenv("ABS_BUILDAPP_START", "2015-01")
         tmp = _fetch_abs_series_via_curl(dataflow=dataflow, key=key, start_period=start_period)
         if not tmp.empty:
@@ -442,6 +507,105 @@ def main() -> None:
             appr_df = tmp
     if not appr_df.empty:
         pieces.append(appr_df)
+
+    # 4) Perth CPI (headline) — prefer API/CSV, else local fallback
+    cpi_df = pd.DataFrame(columns=["month", "perth_cpi"])
+    cpi_sdmx = os.getenv("ABS_PERTH_CPI_SDMX_URL")
+    if cpi_sdmx:
+        tmp = _fetch_sdmx_json(cpi_sdmx)
+        if not tmp.empty:
+            cpi_df = tmp.rename(columns={"value": "perth_cpi"})[["month", "perth_cpi"]]
+
+    if cpi_df.empty:
+        dataflow = os.getenv("ABS_PERTH_CPI_DATAFLOW", "CPI")
+        key = os.getenv("ABS_PERTH_CPI_KEY", "1.10001.10.5.Q")
+        if key:
+            start_period = os.getenv("ABS_PERTH_CPI_START", "2010-Q1")
+            tmp = _fetch_abs_series_via_curl(dataflow=dataflow, key=key, start_period=start_period)
+            if not tmp.empty:
+                cpi_df = tmp.rename(columns={"value": "perth_cpi"})[["month", "perth_cpi"]]
+
+    if cpi_df.empty:
+        cpi_csv_url = os.getenv("PERTH_CPI_CSV_URL") or os.getenv("CPI_CSV_URL")
+        if cpi_csv_url:
+            tmp = _fetch_csv_url(cpi_csv_url, rename_to="perth_cpi")
+            if not tmp.empty:
+                cpi_df = tmp[["month", "perth_cpi"]]
+
+    if cpi_df.empty:
+        tmp = _load_csv_if_exists(EXT_DIR / "perth_cpi.csv",
+                                  {"month": "month", "value": "perth_cpi", "perth_cpi": "perth_cpi"})
+        if not tmp.empty:
+            cpi_df = tmp
+
+    if not cpi_df.empty:
+        pieces.append(cpi_df)
+
+    # Perth CPI – rents subcomponent (monthly indicator) to mirror CoreLogic rents trend
+    cpi_rent_df = pd.DataFrame(columns=["month", "perth_rent_cpi"])
+    cpi_rent_sdmx = os.getenv("ABS_PERTH_RENTS_SDMX_URL")
+    if cpi_rent_sdmx:
+        tmp = _fetch_sdmx_json(cpi_rent_sdmx)
+        if not tmp.empty:
+            cpi_rent_df = tmp.rename(columns={"value": "perth_rent_cpi"})[["month", "perth_rent_cpi"]]
+
+    if cpi_rent_df.empty:
+        rent_key = os.getenv("ABS_PERTH_RENTS_KEY", "1.30003.10.5.M")
+        start_period = os.getenv("ABS_PERTH_RENTS_START", "2015-01")
+        tmp = _fetch_abs_series_via_curl(dataflow="CPI_M", key=rent_key, start_period=start_period)
+        if not tmp.empty:
+            cpi_rent_df = tmp.rename(columns={"value": "perth_rent_cpi"})[["month", "perth_rent_cpi"]]
+
+    if cpi_rent_df.empty:
+        tmp = _load_csv_if_exists(EXT_DIR / "perth_rent_cpi.csv",
+                                  {"month": "month", "value": "perth_rent_cpi", "perth_rent_cpi": "perth_rent_cpi"})
+        if not tmp.empty:
+            cpi_rent_df = tmp
+
+    if not cpi_rent_df.empty:
+        pieces.append(cpi_rent_df)
+
+    # 5) Perth/CoreLogic rent index — CSV only (CoreLogic API requires auth)
+    rent_df = pd.DataFrame(columns=["month", "perth_rent_index"])
+    rent_csv_url = os.getenv("CORELOGIC_RENT_CSV_URL") or os.getenv("PERTH_RENT_INDEX_CSV_URL")
+    if rent_csv_url:
+        tmp = _fetch_csv_url(rent_csv_url, rename_to="perth_rent_index")
+        if not tmp.empty:
+            rent_df = tmp[["month", "perth_rent_index"]]
+
+    if rent_df.empty:
+        tmp = _load_csv_if_exists(EXT_DIR / "perth_rent_index.csv",
+                                  {"month": "month", "value": "perth_rent_index",
+                                   "perth_rent_index": "perth_rent_index"})
+        if not tmp.empty:
+            rent_df = tmp
+
+    if not rent_df.empty:
+        pieces.append(rent_df)
+
+    # 6) Bonds-derived WA rent level (weighted average from bonds_panel_sa2)
+    bonds_path = STAGE_DIR / "bonds_panel_sa2.parquet"
+    if bonds_path.exists():
+        try:
+            bonds = pd.read_parquet(bonds_path).copy()
+            bonds["month"] = to_month(bonds["month"])
+            for col in ["median_rent", "stock_bonds"]:
+                if col not in bonds.columns:
+                    raise ValueError(f"Required column '{col}' missing in {bonds_path}")
+            agg = (
+                bonds.groupby("month")
+                .apply(lambda g: pd.Series({
+                    "wa_bonds_rent_avg": (g["median_rent"] * g["stock_bonds"].fillna(0.0)).sum()
+                                           / max(g["stock_bonds"].fillna(0.0).sum(), 1.0)
+                }))
+                .reset_index()
+            )
+            base = agg["wa_bonds_rent_avg"].iloc[0]
+            if pd.notna(base) and base > 0:
+                agg["wa_bonds_rent_index"] = agg["wa_bonds_rent_avg"] / base * 100.0
+            pieces.append(agg)
+        except Exception as exc:
+            warnings.warn(f"Failed to derive bonds-based rent index: {exc}")
 
     if not pieces:
         print("No external signals found/fetched. Provide API URLs via env vars or CSVs in data_raw/external/.")

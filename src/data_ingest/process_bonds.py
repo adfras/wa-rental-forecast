@@ -1,5 +1,9 @@
 """
-Ingest a raw AHDAP bonds ZIP and build a tidy postcode×month panel.
+Ingest AHDAP/WA bonds ZIPs and build a tidy postcode×month panel.
+
+Accepts either the latest ZIP (default behaviour) or combines ALL available
+ZIPs in `data_raw/` (and optionally `data_raw/legacy/`) to extend history,
+including pre‑2023 drops if provided.
 
 Three families of source files are detected via filename patterns and column
 templates (see `src/column_templates.py`):
@@ -10,7 +14,7 @@ templates (see `src/column_templates.py`):
 Outputs a unified panel with derived features and writes:
   data_stage/bonds_panel_postcode.parquet
 """
-import re, io, zipfile, warnings, os
+import re, io, zipfile, warnings, os, argparse
 import numpy as np
 import pandas as pd
 from dateutil import parser as dparser
@@ -174,14 +178,14 @@ def _select_files(names: list[str], patterns: list[str]) -> list[str]:
     return [n for n in names if any(re.search(p, n, re.I) for p in patterns)]
 
 # ---------- main ----------
-def process_latest_zip() -> None:
-    zips = sorted(RAW_DIR.glob("wa_bonds_*.zip"))
-    if not zips:
-        raise SystemExit("No bonds ZIP found. Run fetch_bonds.py first.")
-    latest = zips[-1]
-    print(f"Processing {latest.name} ...")
+def _aggregate_from_zip(zip_path: os.PathLike[str] | str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return (lodgements_agg, disposals_agg, stock_agg) aggregated from a ZIP.
 
-    with zipfile.ZipFile(latest, "r") as zf:
+    Each DataFrame has keys [postcode, month] and corresponding metrics; these
+    frames are suitable for concatenation across many ZIPs, followed by a final
+    dedup/groupby.
+    """
+    with zipfile.ZipFile(zip_path, "r") as zf:
         names = zf.namelist()
 
         # --- Lodgements ---
@@ -193,12 +197,9 @@ def process_latest_zip() -> None:
                 lodg_dfs.append(_apply_template(df, "lodgements", fn))
         if lodg_dfs:
             lodg = pd.concat(lodg_dfs, ignore_index=True)
-            # keep rows with usable keys
             lodg = lodg.dropna(subset=["month", "postcode", "weekly_rent"]).copy()
             lodg["weekly_rent"] = pd.to_numeric(lodg["weekly_rent"], errors="coerce")
 
-            # Optional winsorization to reduce outlier influence within postcode×month
-            # Enable by setting WINSORIZE_RENT=1 (quantiles via WINSOR_LO/WINSOR_HI, defaults 0.01/0.99)
             if str(os.getenv("WINSORIZE_RENT", "0")).lower() in {"1", "true", "yes"}:
                 try:
                     q_lo = float(os.getenv("WINSOR_LO", "0.01"))
@@ -207,16 +208,13 @@ def process_latest_zip() -> None:
                     q_lo, q_hi = 0.01, 0.99
                 q_lo = max(0.0, min(q_lo, 0.5))
                 q_hi = min(1.0, max(q_hi, 0.5))
-
                 def _winsorize_grp(s: pd.Series) -> pd.Series:
                     s = s.astype(float)
-                    # Require a few observations to compute quantiles sensibly
                     if s.notna().sum() < 8:
                         return s
                     lo = s.quantile(q_lo)
                     hi = s.quantile(q_hi)
                     return s.clip(lower=lo, upper=hi)
-
                 lodg["weekly_rent"] = (
                     lodg.groupby(["postcode", "month"], as_index=False)["weekly_rent"].transform(_winsorize_grp)
                 )
@@ -228,7 +226,6 @@ def process_latest_zip() -> None:
                          count_lodgements=("weekly_rent", "size"))
             )
         else:
-            warnings.warn("No lodgement file(s) detected in ZIP.")
             g = pd.DataFrame(columns=["postcode","month","median_rent","p90_rent","count_lodgements"])
 
         # --- Disposals ---
@@ -248,7 +245,6 @@ def process_latest_zip() -> None:
                          count_disposals=("days_held","size"))
             )
         else:
-            warnings.warn("No disposal/refund file(s) detected in ZIP.")
             d = pd.DataFrame(columns=["postcode","month","mean_days_held","count_disposals"])
 
         # --- Bonds by Postcode (stock) ---
@@ -266,10 +262,19 @@ def process_latest_zip() -> None:
                 stock.groupby(["postcode","month"], as_index=False)
                     .agg(stock_bonds=("bonds_held","max"))   # avoid double-counting
             )
-
         else:
-            warnings.warn("No stock-by-postcode file(s) detected in ZIP.")
             s = pd.DataFrame(columns=["postcode","month","stock_bonds"])
+
+    return g, d, s
+
+
+def process_latest_zip() -> None:
+    zips = sorted(RAW_DIR.glob("wa_bonds_*.zip"))
+    if not zips:
+        raise SystemExit("No bonds ZIP found. Run fetch_bonds.py first.")
+    latest = zips[-1]
+    print(f"Processing {latest.name} ...")
+    g, d, s = _aggregate_from_zip(latest)
 
     # --- Merge & engineer features ---
     panel = (g.merge(d, on=["postcode","month"], how="outer")
@@ -304,5 +309,106 @@ def process_latest_zip() -> None:
     panel.to_parquet(out, index=False)
     print(f"Wrote {out} with {len(panel):,} rows.")
 
+def process_all_zips(include_legacy: bool = True) -> None:
+    """Scan data_raw/ (and optionally data_raw/legacy/) for all ZIPs and combine.
+
+    Deduplicates by recomputing aggregates across all inputs.
+    """
+    search_dirs = [RAW_DIR]
+    legacy_dir = RAW_DIR / "legacy"
+    if include_legacy:
+        search_dirs.append(legacy_dir)
+
+    zip_paths: list[os.PathLike[str]] = []
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        zip_paths.extend(sorted(d.glob("*.zip")))
+
+    if not zip_paths:
+        raise SystemExit("No bonds ZIPs found in data_raw/ (or legacy).")
+
+    print(f"Combining {len(zip_paths)} ZIPs …")
+    all_g, all_d, all_s = [], [], []
+    for zp in zip_paths:
+        try:
+            g, d, s = _aggregate_from_zip(zp)
+            if not g.empty:
+                all_g.append(g)
+            if not d.empty:
+                all_d.append(d)
+            if not s.empty:
+                all_s.append(s)
+        except zipfile.BadZipFile:
+            warnings.warn(f"Skipping invalid ZIP: {zp}")
+            continue
+
+    def _combine(parts: list[pd.DataFrame], how: str) -> pd.DataFrame:
+        if not parts:
+            return pd.DataFrame(columns=["postcode","month"]).astype({"postcode": str})
+        df = pd.concat(parts, ignore_index=True)
+        # Normalize types
+        df["postcode"] = df["postcode"].astype(str)
+        df["month"] = pd.to_datetime(df["month"]).dt.to_period("M").dt.to_timestamp()
+        # Re-aggregate to deduplicate across overlapping months from multiple ZIPs
+        if how == "g":
+            return (
+                df.groupby(["postcode","month"], as_index=False)
+                  .agg(median_rent=("median_rent", "median"),
+                       p90_rent=("p90_rent", "median"),
+                       count_lodgements=("count_lodgements", "sum"))
+            )
+        if how == "d":
+            return (
+                df.groupby(["postcode","month"], as_index=False)
+                  .agg(mean_days_held=("mean_days_held", "mean"),
+                       count_disposals=("count_disposals", "sum"))
+            )
+        if how == "s":
+            return (
+                df.groupby(["postcode","month"], as_index=False)
+                  .agg(stock_bonds=("stock_bonds", "max"))
+            )
+        return df
+
+    G = _combine(all_g, "g")
+    D = _combine(all_d, "d")
+    S = _combine(all_s, "s")
+
+    panel = (G.merge(D, on=["postcode","month"], how="outer")
+               .merge(S, on=["postcode","month"], how="outer"))
+
+    # Feature engineering
+    stock = panel.get("stock_bonds", pd.Series(dtype=float)).fillna(0).astype(float)
+    lodg  = panel.get("count_lodgements", pd.Series(dtype=float)).fillna(0).astype(float)
+    disp  = panel.get("count_disposals", pd.Series(dtype=float)).fillna(0).astype(float)
+    panel["churn_rate"] = (lodg + disp) / stock.clip(lower=1.0)
+    panel["net_stock_change"] = lodg - disp
+    panel = panel.sort_values(["postcode","month"]).reset_index(drop=True)
+    panel["rent_momentum"] = (
+        panel.groupby("postcode")["median_rent"].pct_change(fill_method=None).fillna(0.0)
+    )
+
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    out = STAGE_DIR / "bonds_panel_postcode.parquet"
+    panel.to_parquet(out, index=False)
+    # Quick span
+    if not panel.empty:
+        span = f"{panel['month'].min().date()} → {panel['month'].max().date()} ({panel['month'].nunique()} months)"
+    else:
+        span = "empty"
+    print(f"Wrote {out} with {len(panel):,} rows; span {span}.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Process WA bonds ZIPs into a postcode×month panel")
+    ap.add_argument("--all", dest="all_zips", action="store_true", help="Combine all ZIPs in data_raw/ (+ legacy/) instead of only the latest")
+    ap.add_argument("--no-legacy", dest="no_legacy", action="store_true", help="Do not include data_raw/legacy even when --all is used")
+    args = ap.parse_args()
+    if args.all_zips:
+        process_all_zips(include_legacy=not args.no_legacy)
+    else:
+        process_latest_zip()
+
 if __name__ == "__main__":
-    process_latest_zip()
+    main()

@@ -2,16 +2,29 @@ PY ?= python
 RECENCY ?= 6
 CHAINS ?= 4
 CORES ?= 4
+DRAWS ?= 1500
+TUNE ?= 1500
+TARGET_ACCEPT ?= 0.995
+PYTENSOR_FLAGS_VALUE ?= blas__ldflags=-L/usr/lib/x86_64-linux-gnu -lopenblas
+STAGE_DIR ?= data_stage
+TRAIN_START ?= 2024-03
+TRAIN_END ?= 2025-02
+VAL_START ?= 2025-03
+VAL_END ?= 2025-08
 PORT ?= 8081
 
 .PHONY: fit_latest eval_recent site all_monthly pr_months serve alerts_top20 alerts_best
 
 # Fit latest forecast with calibration + prior-shift + bias correction
 fit_latest:
-	$(PY) -m src.models.forecast \
-		--recency-half-life $(RECENCY) \
-		--chains $(CHAINS) --cores $(CORES) \
-		--bias-correct-l6 --calibrate-isotonic --prior-shift
+	rm -f $(STAGE_DIR)/price_pressure_forecast_sa2_history.parquet
+	PYTENSOR_FLAGS="$(PYTENSOR_FLAGS_VALUE)" $(PY) -m tools.time_split_validate \
+		--train-start $(TRAIN_START) --train-end $(TRAIN_END) \
+		--val-start $(VAL_START) --val-end $(VAL_END) \
+		--walk-forward --recency-half-life $(RECENCY) \
+		--with-external --extra-features --with-spatial \
+		--draws 800 --tune 800 --chains $(CHAINS) --cores $(CORES) \
+		--pymc-target-accept $(TARGET_ACCEPT)
 
 # Evaluate a window; pass START=YYYY-MM END=YYYY-MM
 eval_recent:

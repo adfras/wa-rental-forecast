@@ -13,11 +13,23 @@ COMMANDS = {
     "external-signals": "src.data_ingest.external_signals",
     "model-nowcast": "src.models.nowcast",
     "model-forecast": "src.models.forecast",
+    "model-forecast-gbm": "src.models.forecast_gbm",
     "validate-report": "src.reporting.validate_and_report",
     "evaluate-forecasts": "src.reporting.evaluate_forecasts",
     "build-site": "src.reporting.build_site",
     "run-all": "src.cli.commands.run_all",
     "one-click": "src.cli.commands.one_click",
+    "duck-summary": "tools.duck_summary",
+    # ABS helpers
+    "abs-correspondences": "tools.abs_download_correspondences",
+    "abs-build-sal2sa2": "tools.build_sal_to_sa2_2021",
+    "abs-build-seifa": "tools.build_seifa_sa2_2021",
+    "abs-build-income": "tools.build_sa2_income_2021",
+    "build-reiwa-suburbs": "tools.build_reiwa_suburbs",
+    "build-reiwa-url-manifest": "tools.build_reiwa_url_manifest",
+  "reiwa-crawl-all": "tools.reiwa_crawl_all",
+  "reiwa-import-to-stage": "tools.reiwa_import_to_stage",
+  "value-gain-houseprice": "tools.value_gain_from_houseprice",
 }
 
 

@@ -32,3 +32,12 @@ outputs/
 .vscode/
 .idea/
 *.code-workspace
+
+# TLS bundles generated at runtime
+certs/ckan_ca_bundle.pem
+
+# Compiler caches
+.pytensor/
+.pytensor_cache/
+certs/
+repomix-clean.xml

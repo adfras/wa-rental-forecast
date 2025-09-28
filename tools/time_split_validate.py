@@ -19,14 +19,23 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
+import os
+import time
 from dataclasses import dataclass
 from typing import Tuple
 
+import arviz as az
 import numpy as np
 import pandas as pd
 import pymc as pm
 
-from src.config import STAGE_DIR, RENT_GROWTH_THRESHOLD, RANDOM_SEED
+from src.config import (
+    STAGE_DIR,
+    RENT_GROWTH_THRESHOLD,
+    RANDOM_SEED,
+    FORECAST_RECENCY_HALFLIFE,
+)
 from src.features.dates import (
     build_month_index,
     compute_recency_weights,
@@ -42,6 +51,7 @@ from src.features.engineering import (
     add_interaction_features,
     add_rent_momentum,
     apply_standardization,
+    compute_wa_aggregates,
     ensure_columns,
     standardize_columns,
 )
@@ -60,35 +70,8 @@ except Exception:  # pragma: no cover
 
 
 def _add_wa_aggregates(sa2: pd.DataFrame) -> pd.DataFrame:
-    """Return month-level WA aggregates computed from SA2 panel.
-    Columns: month, wa_rent_mom, wa_churn_rate, wa_stock_growth, wa_disp_rate
-    """
-    df = sa2.copy()
-    df = df.sort_values(['sa2_code','month'])
-    # Compute prev stock per SA2 for growth later
-    df['stock_prev'] = df.groupby('sa2_code')['stock_bonds'].shift(1)
-    # Weighted mean rent momentum by stock (per month)
-    rm = (
-        df.assign(w=lambda x: x['stock_bonds'].fillna(0.0),
-                  wm=lambda x: x['rent_mom_1m'].fillna(0.0) * x['stock_bonds'].fillna(0.0))
-          .groupby('month')
-          .apply(lambda x: x['wm'].sum() / max(x['w'].sum(), 1.0))
-          .to_frame('wa_rent_mom')
-          .reset_index()
-    )
-    # Churn and stock growth at WA level
-    tot = (df.groupby('month', as_index=False)
-             .agg(count_lodgements=('count_lodgements','sum'),
-                  count_disposals=('count_disposals','sum'),
-                  stock_bonds=('stock_bonds','sum'),
-                  stock_prev=('stock_prev','sum')))
-    tot['wa_churn_rate'] = (tot['count_lodgements'] + tot['count_disposals']) / tot['stock_bonds'].clip(lower=1.0)
-    tot['wa_disp_rate'] = (tot['count_disposals']) / tot['stock_bonds'].clip(lower=1.0)
-    with pd.option_context('mode.use_inf_as_na', True):
-        tot['wa_stock_growth'] = tot['stock_bonds'] / tot['stock_prev'] - 1.0
-    tot['wa_stock_growth'] = tot['wa_stock_growth'].fillna(0.0)
-    out = tot[['month','wa_churn_rate','wa_disp_rate','wa_stock_growth']].merge(rm, on='month', how='left')
-    return out.sort_values('month').reset_index(drop=True)
+    """Compatibility shim: delegate to shared helper to avoid divergence."""
+    return compute_wa_aggregates(sa2)
 def _load_external_signals():
     import pandas as pd
     path = STAGE_DIR / "external_signals.parquet"
@@ -293,11 +276,15 @@ def predict_availability(post: NowcastPosterior,
 
 @dataclass
 class ForecastPosterior:
-    beta: np.ndarray     # (S, k)
-    a_sa2: np.ndarray    # (S, n_sa2_train)
-    sa2_index: dict      # code -> idx
-    feat_mu: np.ndarray  # (k,) training standardization mean
-    feat_sd: np.ndarray  # (k,) training standardization std
+    beta: np.ndarray       # (S, k)
+    a_sa2: np.ndarray      # (S, n_sa2_train)
+    month_effect: np.ndarray  # (S, n_months)
+    cluster_effect: np.ndarray  # (S, n_clusters)
+    sa2_index: dict        # code -> idx
+    month_index: dict      # month Timestamp -> idx
+    cluster_index: dict    # sa2_code -> cluster idx
+    feat_mu: np.ndarray    # (k,) training standardization mean
+    feat_sd: np.ndarray    # (k,) training standardization std
     divergences: int = 0
 
 
@@ -307,15 +294,46 @@ def fit_forecast_train(train_df: pd.DataFrame,
                        trace_dir: 'Path | None' = None,
                        trace_name: str | None = None,
                        leakage_canary: bool = False,
-                       recency_half_life: float | None = None) -> Tuple[ForecastPosterior, pd.DataFrame]:
+                       recency_half_life: float | None = None,
+                       init: str = "adapt_diag_grad",
+                       rhat_max: float = 1.01,
+                       sampler_retries: int = 2,
+                       retry_draw_multiplier: float = 1.5) -> Tuple[ForecastPosterior, pd.DataFrame]:
     # Prepare features/labels (impute NaNs with feature-wise train means to keep early months)
     df = train_df.dropna(subset=["y"]).copy()
+    df["_is_pseudo"] = False
+    grp = df.groupby("sa2_code")["y"].agg(["count", "sum"]).reset_index()
+    pseudo_rows: list[pd.Series] = []
+    pseudo_weight = float(os.getenv("PSEUDO_LABEL_WEIGHT", "0.05"))
+    for _, row in grp.iterrows():
+        count = int(row["count"])
+        positive = float(row["sum"])
+        if count == 0:
+            continue
+        if positive == 0.0 or positive == float(count):
+            sa2_code = str(row["sa2_code"])
+            group_df = df[df["sa2_code"] == sa2_code]
+            if group_df.empty:
+                continue
+            template = group_df.iloc[-1].copy()
+            template["_is_pseudo"] = True
+            template["y"] = 1.0 if positive == 0.0 else 0.0
+            pseudo_rows.append(template)
+    if pseudo_rows:
+        pseudo_df = pd.DataFrame(pseudo_rows)
+        df = pd.concat([df, pseudo_df], ignore_index=True)
+    pseudo_mask = df["_is_pseudo"].astype(bool).to_numpy()
+    df = df.drop(columns=["_is_pseudo"])
+
     Xz, mu, sd = standardize_columns(df, feat_cols)
-    Xz = np.clip(Xz, -5.0, 5.0)
+    Xz = _clip_standardized_matrix(Xz)
 
     sa2_codes = pd.Index(sorted(df["sa2_code"].unique()))
     sa2_cat = pd.Categorical(df["sa2_code"], categories=sa2_codes)
     sa2_idx = sa2_cat.codes.astype(int)
+    month_codes = pd.Index(sorted(df["month"].unique()))
+    month_cat = pd.Categorical(df["month"], categories=month_codes)
+    month_idx = month_cat.codes.astype(int)
     y = df["y"].astype(int).to_numpy()
     if leakage_canary:
         # Randomly permute labels to collapse any leakage-driven signal
@@ -324,26 +342,146 @@ def fit_forecast_train(train_df: pd.DataFrame,
 
     # Optional recency weights (half-life in months; newer rows get higher weight)
     w = compute_recency_weights(df["month"], recency_half_life)
+    if pseudo_mask.any():
+        base_w = np.ones(len(df), dtype=float) if w is None else np.asarray(w, dtype=float)
+        base_w[pseudo_mask] = max(1e-3, pseudo_weight)
+        w = base_w
+    elif w is not None:
+        w = np.asarray(w, dtype=float)
 
     n_sa2 = len(sa2_codes)
+    n_month = len(month_codes)
     n, k = Xz.shape
+
+    cluster_map: dict[str, int] = {code: 0 for code in sa2_codes.astype(str)}
+    cluster_idx = np.zeros(len(df), dtype=int)
+    price_col = None
+    for candidate in ["price_level_log", "median_house_price", "price_yield"]:
+        if candidate in df.columns and df[candidate].notna().any():
+            price_col = candidate
+            break
+    if price_col is not None:
+        sa2_price = (df[["sa2_code", price_col]]
+                        .dropna()
+                        .groupby("sa2_code")[price_col]
+                        .mean())
+        if not sa2_price.empty:
+            unique_vals = sa2_price.dropna().unique()
+            q = int(min(5, len(unique_vals)))
+            if q > 1:
+                labels = pd.qcut(sa2_price, q=q, labels=False, duplicates="drop")
+            else:
+                labels = sa2_price.map(lambda _: 0)
+            for code, lab in labels.items():
+                cluster_map[str(code)] = int(lab)
+            cluster_idx = df["sa2_code"].map(lambda c: cluster_map.get(str(c), 0)).astype(int).to_numpy()
+    n_cluster = int(max(cluster_map.values(), default=0) + 1)
 
     with pm.Model() as m:
         beta = pm.Normal("beta", 0.0, 0.5, shape=k)
-        mu_a = pm.Normal("mu_a", 0.0, 0.5)
-        sigma_a = pm.HalfNormal("sigma_a", 0.3)
+        mu_a = pm.Normal("mu_a", 0.0, 1.5)
+        sigma_a = pm.HalfNormal("sigma_a", 1.0)
         z_a = pm.Normal("z_a", 0.0, 1.0, shape=n_sa2)
         a_sa2 = pm.Deterministic("a_sa2", mu_a + z_a * sigma_a)
-        eta = a_sa2[sa2_idx] + pm.math.dot(Xz, beta)
+        sigma_month = pm.HalfNormal("sigma_month", 1.0)
+        z_month = pm.Normal("z_month", 0.0, 1.0, shape=n_month)
+        month_effect = pm.Deterministic("month_effect", z_month * sigma_month)
+        sigma_cluster = pm.HalfNormal("sigma_cluster", 1.0)
+        z_cluster = pm.Normal("z_cluster", 0.0, 1.0, shape=n_cluster)
+        cluster_effect = pm.Deterministic("cluster_effect", z_cluster * sigma_cluster)
+        eta = a_sa2[sa2_idx] + month_effect[month_idx] + cluster_effect[cluster_idx] + pm.math.dot(Xz, beta)
+        # Optional varying slopes by SA2 for key drivers
+        idxmap = {c:i for i,c in enumerate(feat_cols)}
+        idx_price = idxmap.get("price_band_high")
+        idx_rm1 = idxmap.get("rent_mom_1m")
+        if idx_price is not None:
+            mu_b_pr = pm.Normal("mu_b_pr", 0.0, 0.5)
+            sigma_b_pr = pm.HalfNormal("sigma_b_pr", 0.7)
+            z_b_pr = pm.Normal("z_b_pr", 0.0, 1.0, shape=n_sa2)
+            b_pr_sa2 = pm.Deterministic("b_pr_sa2", mu_b_pr + z_b_pr * sigma_b_pr)
+            eta = eta + b_pr_sa2[sa2_idx] * Xz[:, idx_price]
+        if idx_rm1 is not None:
+            mu_b_rm1 = pm.Normal("mu_b_rm1", 0.0, 0.5)
+            sigma_b_rm1 = pm.HalfNormal("sigma_b_rm1", 0.7)
+            z_b_rm1 = pm.Normal("z_b_rm1", 0.0, 1.0, shape=n_sa2)
+            b_rm1_sa2 = pm.Deterministic("b_rm1_sa2", mu_b_rm1 + z_b_rm1 * sigma_b_rm1)
+            eta = eta + b_rm1_sa2[sa2_idx] * Xz[:, idx_rm1]
         if w is None:
             pm.Bernoulli("y", logit_p=eta, observed=y)
         else:
             y_dist = pm.Bernoulli.dist(logit_p=eta)
             pm.Potential("weighted_loglik_binom", (w * pm.logp(y_dist, y)).sum())
-        idata = pm.sample(
-            draws=draws, tune=tune, chains=chains, cores=cores, target_accept=target_accept,
-            random_seed=RANDOM_SEED, progressbar=True
-        )
+        def _run_pymc(draws_now: int, tune_now: int, init_arg: str) -> az.InferenceData:
+            t0_local = time.time()
+            idata_local = pm.sample(
+                draws=draws_now,
+                tune=tune_now,
+                chains=chains,
+                cores=cores,
+                target_accept=target_accept,
+                random_seed=RANDOM_SEED,
+                progressbar=True,
+                init=init_arg,
+            )
+            try:
+                print(f"[time] PyMC sampling took {time.time()-t0_local:.1f}s")
+            except Exception:
+                pass
+            return idata_local
+
+        def _sample_once(draws_now: int, tune_now: int) -> az.InferenceData:
+            try:
+                return _run_pymc(draws_now, tune_now, init)
+            except ValueError as exc:
+                if "Unknown initializer" in str(exc):
+                    return _run_pymc(draws_now, tune_now, "jitter+adapt_diag")
+                raise
+
+        draws_now = max(int(draws), 1)
+        tune_now = max(int(tune), 0)
+        attempts = 0
+        max_attempts = max(0, int(sampler_retries)) + 1
+        idata = None
+
+        while True:
+            attempts += 1
+            idata = _sample_once(draws_now, tune_now)
+
+            max_rhat = float("nan")
+            if chains >= 2:
+                try:
+                    rhat_da = az.rhat(idata, method="rank")
+                    if hasattr(rhat_da, "to_array"):
+                        max_rhat = float(np.nanmax(rhat_da.to_array().values))
+                    else:
+                        max_rhat = float(np.nanmax(np.asarray(rhat_da)))
+                except Exception:
+                    max_rhat = float("nan")
+
+            if not math.isfinite(max_rhat) or max_rhat <= rhat_max:
+                break
+            if attempts >= max_attempts:
+                print(
+                    f"[warn] Max rhat {max_rhat:.3f} > {rhat_max:.3f} after {attempts} attempts; proceeding with latest sample.",
+                    flush=True,
+                )
+                break
+
+            grows = max(1.0, float(retry_draw_multiplier))
+            draws_next = int(math.ceil(draws_now * grows))
+            tune_next = int(math.ceil(tune_now * grows))
+            if draws_next == draws_now:
+                draws_next += 100
+            if tune_next == tune_now:
+                tune_next += 100
+            print(
+                f"[warn] Max rhat {max_rhat:.3f} > {rhat_max:.3f}; retrying with draws={draws_next}, tune={tune_next}.",
+                flush=True,
+            )
+            draws_now, tune_now = draws_next, tune_next
+
+        draws = draws_now
+        tune = tune_now
     # Optional: persist trace for verification
     if trace_dir is not None:
         trace_dir.mkdir(parents=True, exist_ok=True)
@@ -364,13 +502,19 @@ def fit_forecast_train(train_df: pd.DataFrame,
     if beta_s.ndim == 1:
         beta_s = beta_s.reshape(-1, 1)
     a_sa2_s = stack("a_sa2")  # (S, n_sa2)
+    month_effect_s = stack("month_effect")  # (S, n_month)
+    cluster_effect_s = stack("cluster_effect")  # (S, n_cluster)
 
     divergences = int(idata.sample_stats["diverging"].sum().item())
 
     post = ForecastPosterior(
         beta=beta_s,
         a_sa2=a_sa2_s,
+        month_effect=month_effect_s,
+        cluster_effect=cluster_effect_s,
         sa2_index={code: i for i, code in enumerate(sa2_codes)},
+        month_index={pd.Timestamp(m): i for i, m in enumerate(month_codes)},
+        cluster_index={code: cluster_map.get(str(code), 0) for code in sa2_codes.astype(str)},
         feat_mu=mu,
         feat_sd=sd,
         divergences=divergences,
@@ -388,7 +532,7 @@ def predict_forecast(post: ForecastPosterior,
     matching the behavior in src/model_forecast.py.
     """
     Xz = apply_standardization(base_df, feat_cols, post.feat_mu, post.feat_sd)
-    Xz = np.clip(Xz, -5.0, 5.0)
+    Xz = _clip_standardized_matrix(Xz)
 
     S, k = post.beta.shape
     probs = np.zeros(len(base_df), dtype=float)
@@ -400,6 +544,15 @@ def predict_forecast(post: ForecastPosterior,
         lin = post.beta @ Xz[i, :]  # (S,)
         if idx >= 0:
             lin = lin + post.a_sa2[:, idx]
+        month_val = pd.Timestamp(row["month"]) if "month" in row else None
+        if month_val is not None:
+            midx = post.month_index.get(month_val, None)
+            if midx is not None:
+                lin = lin + post.month_effect[:, midx]
+        cidx = post.cluster_index.get(str(row["sa2_code"]), 0)
+        lin = lin + post.cluster_effect[:, cidx]
+        cidx = post.cluster_index.get(str(row["sa2_code"]), 0)
+        lin = lin + post.cluster_effect[:, cidx]
         # numerically stable expit to avoid overflow warnings on extreme logits
         lin_c = np.clip(lin, -500, 500)
         ps = 1.0 / (1.0 + np.exp(-lin_c))
@@ -607,6 +760,60 @@ def _add_neighbor_availability(df: pd.DataFrame, adj: pd.DataFrame) -> pd.DataFr
     return out
 
 
+def _winsorize_series(s: pd.Series,
+                      *,
+                      lower_q: float = 0.01,
+                      upper_q: float = 0.99,
+                      lower_bound: float | None = None,
+                      upper_bound: float | None = None) -> pd.Series:
+    if s.dropna().empty:
+        return s
+    series = s.astype(float)
+    try:
+        low = float(series.quantile(lower_q))
+    except Exception:
+        low = np.nan
+    try:
+        high = float(series.quantile(upper_q))
+    except Exception:
+        high = np.nan
+    if lower_bound is not None:
+        low = lower_bound if not np.isfinite(low) else max(low, lower_bound)
+    if upper_bound is not None:
+        high = upper_bound if not np.isfinite(high) else min(high, upper_bound)
+    if not np.isfinite(low):
+        low = lower_bound
+    if not np.isfinite(high):
+        high = upper_bound
+    if low is not None and high is not None and low > high:
+        low, high = high, low
+    return series.clip(lower=low, upper=high)
+
+
+def _clip_standardized_matrix(X: np.ndarray,
+                              *,
+                              quantile: float = 0.995,
+                              min_limit: float = 3.0,
+                              max_limit: float = 10.0) -> np.ndarray:
+    if X.size == 0:
+        return X
+    limits = np.nanquantile(np.abs(X), quantile, axis=0)
+    limits = np.where(~np.isfinite(limits) | (limits < min_limit), min_limit, limits)
+    limits = np.where(limits > max_limit, max_limit, limits)
+    Xc = X.copy()
+    for j, lim in enumerate(limits):
+        Xc[:, j] = np.clip(Xc[:, j], -lim, lim)
+    return Xc
+
+
+def _format_threshold_suffix(threshold: float) -> str:
+    """Return a filesystem-friendly suffix for a given threshold."""
+    formatted = f"{threshold:.3f}".rstrip("0").rstrip(".")
+    if not formatted:
+        formatted = "0"
+    return f"thr{formatted.replace('.', 'p')}"
+
+
 def main(train_start: pd.Timestamp,
          train_end: pd.Timestamp,
          val_start: pd.Timestamp,
@@ -619,7 +826,7 @@ def main(train_start: pd.Timestamp,
          with_spatial: bool = False,
          leakage_canary: bool = False,
          extra_features: bool = False,
-         recency_half_life: float | None = None,
+         recency_half_life: float | None = FORECAST_RECENCY_HALFLIFE,
          use_gbm: bool = False,
          stack_gbm: bool = False,
          calibrate_isotonic: bool = False,
@@ -628,7 +835,12 @@ def main(train_start: pd.Timestamp,
          gbm_early_stopping: int | None = 50,
          gbm_val_fraction: float = 0.2,
          gbm_log_period: int | None = 50,
-         pymc_target_accept: float = 0.99):
+         pymc_target_accept: float = 0.99,
+         sampler_rhat_max: float = 1.01,
+         sampler_retries: int = 2,
+         retry_draw_multiplier: float = 1.5,
+         force_refit_nowcast: bool = False,
+         output_suffix: str | None = None):
     # Load SA2 panel
     sa2 = pd.read_parquet(STAGE_DIR / "bonds_panel_sa2.parquet").copy()
     ensure_columns(sa2, ["sa2_code", "month", "median_rent", "count_disposals", "stock_bonds"])
@@ -660,7 +872,7 @@ def main(train_start: pd.Timestamp,
     adj = _ensure_adjacency() if with_spatial else None
 
     # Optional cached availability to skip PyMC sampling when present
-    cached_nowcast = _load_cached_nowcast()
+    cached_nowcast = None if force_refit_nowcast else _load_cached_nowcast()
 
     if not walk_forward:
         # ===== Fixed-split mode =====
@@ -701,6 +913,74 @@ def main(train_start: pd.Timestamp,
             avail_all = _add_neighbor_availability(avail_all, adj)
 
         df = _build_feature_frame(sa2, avail_all, threshold)
+        # ---- House price features (monthly medians preferred; fallback to snapshot) ----
+        try:
+            hp_monthly_path = STAGE_DIR / "house_prices_sa2_monthly.parquet"
+            hp_snapshot_path = STAGE_DIR / "house_prices_sa2_snapshot.parquet"
+            hp: pd.DataFrame | None = None
+            if hp_monthly_path.exists():
+                hp = pd.read_parquet(hp_monthly_path).copy()
+            elif hp_snapshot_path.exists():
+                hp = pd.read_parquet(hp_snapshot_path).copy()
+            if hp is not None and not hp.empty:
+                rename_cols = {}
+                if "allocation_weight_sum" in hp.columns:
+                    rename_cols["allocation_weight_sum"] = "price_allocation_weight_sum"
+                if "n_suburbs" in hp.columns:
+                    rename_cols["n_suburbs"] = "price_suburb_count"
+                if rename_cols:
+                    hp = hp.rename(columns=rename_cols)
+                keep_cols = [
+                    c for c in ["sa2_code", "month", "median_house_price",
+                                 "price_allocation_weight_sum", "price_suburb_count"]
+                    if c in hp.columns
+                ]
+                hp = hp[keep_cols].copy()
+                hp["sa2_code"] = hp["sa2_code"].astype(str)
+                hp["month"] = to_month(hp["month"])  # normalize
+
+                months_all = pd.DataFrame({"month": sorted(df["month"].unique())})
+
+                def _expand(g: pd.DataFrame) -> pd.DataFrame:
+                    cols = [c for c in g.columns if c in {"month", "median_house_price", "price_allocation_weight_sum", "price_suburb_count"}]
+                    out = months_all.merge(g[cols], on="month", how="left").sort_values("month")
+                    out["median_house_price"] = out["median_house_price"].ffill()
+                    if "price_allocation_weight_sum" in out.columns:
+                        out["price_allocation_weight_sum"] = out["price_allocation_weight_sum"].ffill()
+                    if "price_suburb_count" in out.columns:
+                        out["price_suburb_count"] = out["price_suburb_count"].ffill()
+                    out["sa2_code"] = g["sa2_code"].iloc[0]
+                    return out
+
+                hp_exp = hp.groupby("sa2_code", group_keys=False).apply(_expand)
+                df = df.merge(hp_exp, on=["sa2_code", "month"], how="left")
+                df = df.sort_values(["sa2_code", "month"]).copy()
+
+                df["price_level_log"] = np.log(df["median_house_price"])
+                wa_med = df.groupby("month")["median_house_price"].transform("median")
+                df["price_band_high"] = (df["median_house_price"] >= wa_med).astype(float)
+                df["price_yield"] = (df["median_rent"] * 52.0) / df["median_house_price"]
+                df["price_mom_3m"] = (df["median_house_price"] / df.groupby("sa2_code")["median_house_price"].shift(3)) ** (1/3) - 1.0
+                df["price_mom_3m"] = df["price_mom_3m"].fillna(0.0)
+                df["price_level_log_wa_dev"] = df["price_level_log"] - df.groupby("month")["price_level_log"].transform("mean")
+                df["price_yield_wa_dev"] = df["price_yield"] - df.groupby("month")["price_yield"].transform("mean")
+                if "price_allocation_weight_sum" in df.columns:
+                    df["price_allocation_weight_sum"] = df["price_allocation_weight_sum"].clip(lower=0.0, upper=1.2)
+                if "price_suburb_count" in df.columns:
+                    df["price_suburb_count"] = df["price_suburb_count"].fillna(0.0)
+
+                df["availability_rate__x__price_band"] = df["availability_rate"] * df["price_band_high"]
+                df["rent_mom_1m__x__price_band"] = df["rent_mom_1m"] * df["price_band_high"]
+                for c in [
+                    "price_level_log", "price_band_high", "price_yield",
+                    "price_level_log_wa_dev", "price_yield_wa_dev", "price_mom_3m",
+                    "price_allocation_weight_sum", "price_suburb_count",
+                    "availability_rate__x__price_band", "rent_mom_1m__x__price_band",
+                ]:
+                    if c not in feat_cols and c in df.columns:
+                        feat_cols.append(c)
+        except Exception:
+            pass
         if with_spatial and "nbr_availability_rate" in avail_all.columns:
             # Merge neighbor feature into df
             df = df.merge(
@@ -778,6 +1058,9 @@ def main(train_start: pd.Timestamp,
                             f"_val_{val_start.strftime('%Y-%m')}_{val_end.strftime('%Y-%m')}.nc") if trace_dir else None,
                 leakage_canary=leakage_canary,
                 recency_half_life=recency_half_life,
+                rhat_max=sampler_rhat_max,
+                sampler_retries=sampler_retries,
+                retry_draw_multiplier=retry_draw_multiplier,
             )
             if post_fc.divergences:
                 print(
@@ -1044,6 +1327,9 @@ def main(train_start: pd.Timestamp,
                     trace_name=f"forecast_until_{prev_month(prev_month(T)).strftime('%Y-%m')}.nc" if trace_dir else None,
                     leakage_canary=leakage_canary,
                     recency_half_life=recency_half_life,
+                    rhat_max=sampler_rhat_max,
+                    sampler_retries=sampler_retries,
+                    retry_draw_multiplier=retry_draw_multiplier,
                 )
                 if post_fc.divergences:
                     print(
@@ -1175,18 +1461,28 @@ def main(train_start: pd.Timestamp,
         new_df = pd.concat(preds, ignore_index=True)
 
     # Append to history parquet, dedup by (sa2_code, month) keeping newest
-    hist_path = STAGE_DIR / "price_pressure_forecast_sa2_history.parquet"
+    new_df["rent_jump_threshold"] = float(threshold)
+
+    suffix = output_suffix
+    if suffix is None and not math.isclose(threshold, RENT_GROWTH_THRESHOLD):
+        suffix = _format_threshold_suffix(threshold)
+    hist_name = "price_pressure_forecast_sa2_history.parquet" if not suffix else f"price_pressure_forecast_sa2_history_{suffix}.parquet"
+    hist_path = STAGE_DIR / hist_name
     try:
         old = pd.read_parquet(hist_path)
         combined = (pd.concat([old, new_df], ignore_index=True)
-                    .drop_duplicates(subset=["sa2_code", "month"], keep="last")
+                    .drop_duplicates(subset=["sa2_code", "month", "rent_jump_threshold"], keep="last")
                     .sort_values(["sa2_code", "month"]))
     except FileNotFoundError:
         combined = new_df.copy()
 
     STAGE_DIR.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(hist_path, index=False)
-    print(f"Wrote {len(new_df)} validation predictions → {hist_path} (months={sorted({m.strftime('%Y-%m') for m in new_df['month'].unique()})})")
+    months_written = sorted({m.strftime('%Y-%m') for m in new_df['month'].unique()})
+    print(
+        f"Wrote {len(new_df)} validation predictions @ threshold={threshold:.3f} "
+        f"→ {hist_path} (months={months_written})"
+    )
 
 
 if __name__ == "__main__":
@@ -1197,6 +1493,8 @@ if __name__ == "__main__":
     ap.add_argument("--val-end", required=True, type=parse_ym)
     ap.add_argument("--threshold", type=float, default=RENT_GROWTH_THRESHOLD,
                     help=f"Rent growth threshold for label (default {RENT_GROWTH_THRESHOLD})")
+    ap.add_argument("--threshold-grid", type=float, nargs="+", default=None,
+                    help="Optional list of thresholds to iterate sequentially.")
     ap.add_argument("--walk-forward", action="store_true",
                     help="Refit per target month using all data up to T-1 (operational realism)")
     ap.add_argument("--with-external", action="store_true",
@@ -1213,8 +1511,10 @@ if __name__ == "__main__":
     ap.add_argument("--cores", type=int, default=4, help="Worker cores (set 1 for restricted envs)")
     ap.add_argument("--trace-dir", type=str, default=None,
                     help="Directory to save PyMC traces (NetCDF) for verification")
-    ap.add_argument("--recency-half-life", type=float, default=None,
-                    help="Half-life in months for sample recency weights (e.g., 12 → 50% weight per year older)")
+    ap.add_argument("--recency-half-life", type=float, default=FORECAST_RECENCY_HALFLIFE,
+                    help="Half-life in months for sample recency weights (default from config).")
+    ap.add_argument("--no-recency-weights", action="store_true",
+                    help="Disable recency weighting (treat all months equally).")
     ap.add_argument("--use-gbm", action="store_true", help="Use a boosted-tree classifier instead of the Bayesian logistic")
     ap.add_argument("--stack-gbm", action="store_true", help="Blend Bayesian logistic with GBM (simple average)")
     ap.add_argument("--calibrate-isotonic", action="store_true", help="Apply isotonic calibration trained on train window")
@@ -1230,17 +1530,42 @@ if __name__ == "__main__":
                     help="Emit LightGBM eval logs every N rounds (set 0 to silence)")
     ap.add_argument("--pymc-target-accept", type=float, default=0.99,
                     help="Target acceptance rate for PyMC NUTS (default 0.99)")
+    ap.add_argument("--sampler-rhat-max", type=float, default=1.01,
+                    help="Maximum acceptable rank-based R-hat before adding more draws (default 1.01).")
+    ap.add_argument("--sampler-retries", type=int, default=2,
+                    help="Extra retries with more draws/tune when R-hat is above the limit (default 2).")
+    ap.add_argument("--retry-draw-multiplier", type=float, default=1.5,
+                    help="Multiplier applied to draws/tune for each retry (default 1.5).")
+    ap.add_argument("--force-refit-nowcast", action="store_true",
+                    help="Ignore cached availability and refit the PyMC nowcast")
+    ap.add_argument("--output-suffix", type=str, default=None,
+                    help="Optional suffix for output files (overrides auto suffix when using alternate thresholds).")
     args = ap.parse_args()
 
     from pathlib import Path as _Path
     tdir = _Path(args.trace_dir) if args.trace_dir else None
-    main(args.train_start, args.train_end, args.val_start, args.val_end,
-         threshold=args.threshold, walk_forward=args.walk_forward,
-         draws=args.draws, tune=args.tune, chains=args.chains, cores=args.cores,
-         trace_dir=tdir, leakage_canary=args.leakage_canary, with_external=args.with_external,
-         extra_features=args.extra_features, recency_half_life=args.recency_half_life,
-         use_gbm=args.use_gbm, stack_gbm=args.stack_gbm, calibrate_isotonic=args.calibrate_isotonic,
-         gbm_learning_rate=args.gbm_learning_rate, gbm_rounds=args.gbm_rounds,
-         gbm_early_stopping=args.gbm_early_stopping,
-         gbm_val_fraction=args.gbm_val_fraction, gbm_log_period=args.gbm_log_period,
-         pymc_target_accept=args.pymc_target_accept)
+    thresholds = args.threshold_grid if args.threshold_grid else [args.threshold]
+
+    for thr in thresholds:
+        suffix = args.output_suffix
+        if suffix is None and not math.isclose(thr, RENT_GROWTH_THRESHOLD):
+            suffix = _format_threshold_suffix(thr)
+        elif suffix is not None and len(thresholds) > 1:
+            # Ensure unique suffix per threshold when user supplies base suffix
+            suffix = f"{suffix}_{_format_threshold_suffix(thr)}"
+
+        main(args.train_start, args.train_end, args.val_start, args.val_end,
+             threshold=thr, walk_forward=args.walk_forward,
+             draws=args.draws, tune=args.tune, chains=args.chains, cores=args.cores,
+             trace_dir=tdir, leakage_canary=args.leakage_canary, with_external=args.with_external,
+             extra_features=args.extra_features, recency_half_life=None if args.no_recency_weights else args.recency_half_life,
+             use_gbm=args.use_gbm, stack_gbm=args.stack_gbm, calibrate_isotonic=args.calibrate_isotonic,
+             gbm_learning_rate=args.gbm_learning_rate, gbm_rounds=args.gbm_rounds,
+             gbm_early_stopping=args.gbm_early_stopping,
+             gbm_val_fraction=args.gbm_val_fraction, gbm_log_period=args.gbm_log_period,
+             pymc_target_accept=args.pymc_target_accept,
+             sampler_rhat_max=args.sampler_rhat_max,
+             sampler_retries=args.sampler_retries,
+             retry_draw_multiplier=args.retry_draw_multiplier,
+             force_refit_nowcast=args.force_refit_nowcast,
+             output_suffix=suffix)

@@ -1,0 +1,6 @@
+# One URL or local path per line. Lines starting with # are ignored.
+# Examples (replace with real sources you have access to):
+# https://example.org/wa-bonds/bonds_by_postcode_summary_csv2019.zip
+# https://example.org/wa-bonds/monthly_bond_lodgement_summary_csv2019.zip
+# https://example.org/wa-bonds/monthly_bond_disposal_summary_csv2019.zip
+# /mnt/data/wa_bonds_archives/2018.zip

@@ -31,6 +31,9 @@ POA_SA2_CORRESP = RAW_DIR / "CG_POA_2021_SA2_2021.xlsx"
 RENT_GROWTH_THRESHOLD = 0.02  # 2% month-over-month
 RANDOM_SEED = 42
 
+# Sample weighting defaults
+FORECAST_RECENCY_HALFLIFE = 12  # months
+
 def ensure_dirs():
     for d in [RAW_DIR, STAGE_DIR, OUTPUTS_DIR, OUT_DIR, FIG_DIR, REPORT_DIR, EVAL_DIR, TESTS_OUT_DIR]:
         d.mkdir(parents=True, exist_ok=True)

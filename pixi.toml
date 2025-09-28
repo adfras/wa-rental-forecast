@@ -1,0 +1,36 @@
+[project]
+name = "wa_rental_pipeline"
+version = "0.1.0"
+channels = ["conda-forge"]
+
+[tasks]
+one_click = "python -m src.cli one-click"
+fit_latest = "python -m src.models.forecast --recency-half-life 12 --draws 1500 --tune 1500 --chains 4 --cores 4 --target-accept 0.995 --sampler blackjax --bias-correct-l6 --calibrate-isotonic --prior-shift"
+
+[dependencies]
+python = "3.12"
+libblas = "*=*openblas"
+numpy = "<=2.2"
+pandas = ">=2.2"
+pyarrow = ">=14"
+polars = ">=1.5"
+duckdb = ">=1.0"
+geopandas = ">=1.0"
+pyogrio = ">=0.9"
+shapely = ">=2.0"
+folium = ">=0.17"
+branca = ">=0.7"
+matplotlib = ">=3.8"
+pymc = ">=5.14"
+pytensor = ">=2.16"
+arviz = ">=0.18"
+jax = ">=0.4"
+jaxlib = ">=0.4"
+lightgbm = ">=4.5"
+scikit-learn = ">=1.5"
+requests = ">=2.31"
+tqdm = ">=4.66"
+openpyxl = ">=3.1"
+
+[pypi-dependencies]
+pytrends = "^4.9.2"
