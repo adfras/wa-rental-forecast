@@ -1,125 +1,96 @@
 # WA Rental Forecast
 
-**Bayesian nowcast + forecast of rental price pressure at SA2 level (Western Australia).** Outputs a Top‑20 list, an interactive map, and a spreadsheet of probabilities that **next month’s median rent rises by more than 2 %** (default threshold), with automatic monthly back‑testing once new data lands.
+**Bayesian nowcast + forecast of rental price pressure at SA2 level (Western Australia).**  
+Outputs a Top‑20 list, an interactive map, and a spreadsheet of probabilities that **next month’s median rent rises by more than 2%** (default threshold), with automatic monthly back‑testing once new data lands.
 
-- **Live site:** https://wa-rental-forecast.netlify.app
-- **Last end-to-end update:** 16 October 2025 (includes lodgement-aware smoothing, sparse-market features, and booster diagnostics.)
-
----
-
-## 1. Documentation Index & Project Map
-
-| Topic | Location | Notes |
-|-------|----------|-------|
-| Code flow & responsibilities | [docs/CODEMAP.md](docs/CODEMAP.md) | Core vs optional modules, orchestration entrypoints. |
-| Data dictionary | [docs/DATA_DICTIONARY.md](docs/DATA_DICTIONARY.md) | Column-level descriptions for staged parquet + site JSON. |
-| Experiment history | [docs/EXPERIMENT_LOG.md](docs/EXPERIMENT_LOG.md) | Chronological run settings, sampler configs, key metrics.<br/>Entry **ID 9 (2025‑10‑16)** logs the sparse-market booster & diagnostics. |
-| Lodgement weighting rationale | [docs/reports/2025-10-15_lodgement_weighting.md](docs/reports/2025-10-15_lodgement_weighting.md) | Design note for supply-shock + lodgement weighting refit. |
-| Outstanding work | [TODO.md](TODO.md) | Research backlog; focus areas called out in sparse SA2 mitigation. |
-| Site JSON snapshots | `docs/data/` | One file per month per threshold; consumed by Netlify site. |
-
-For a guided walkthrough of the codebase, start with [docs/CODEMAP.md](docs/CODEMAP.md) and follow the links above.
+**Live site:** https://wa-rental-forecast.netlify.app
 
 ---
 
-## 2. Operational Runbook (Monthly Release)
-
-### 2.1 Pre-flight checklist
-
-1. **Environment** – Activate the venv (`source .venv/bin/activate`). Verify `make --version` and `python --version` (>=3.12).  
-2. **Data freshness** – Run `python -m src.data_ingest.fetch_bonds` if the AHDAP CKAN has a new ZIP; confirm `data_stage/bonds_panel_sa2.parquet` ends at last month.  
-3. **Diagnostics (sparse SA2s)** – `python tools/sparse_sa2_diagnostic.py` generates `outputs/tables/sparse_sa2_summary.csv` and plots in `outputs/figures/`. Review Roebourne, Gnowangerup, Morawa, City Beach before rerunning the forecast.
-
-### 2.2 Standard monthly run (heavy configuration)
+## Quick Start
 
 ```bash
-source .venv/bin/activate
-make fit_latest          # walk-forward 2023-03…latest-1 with 6×1 800 draws/tune, isotonic calibration
-make eval_recent START=2025-08 END=$(date -d "$(date +%Y-%m-01) -1 month" +%Y-%m)
-make site                # rebuild docs/ for Netlify
+# 1) Fit latest forecast (recency=6, calibrated, prior-shift, bias-correct)
+make fit_latest
+
+# 2) Evaluate recent months (example: last two)
+make eval_recent START=2025-07 END=2025-08
+
+# 3) Build and serve the site
+make site
+make serve   # open http://localhost:8081
 ```
 
-This resets `data_stage/price_pressure_forecast_sa2_history.parquet` and rewrites multi-threshold histories (`thr0p010`, `thr0p020`, `thr0p030`) using the new sparse-market features and booster logit.
+> **New (Sept 2025)** – Major pipeline tidy-up:
+> - Shared feature helpers now live under `src/features/`, keeping the forecast, validator, and utilities aligned on WA-demeaned drivers and interaction terms.
+> - `src/models/forecast.py` now auto-calibrates, emits full threshold sweeps to `outputs/evaluations/forecast_training_metrics.json`, and supports optional prior-shift + bias fixes.
+> - `src/data_ingest/external_signals.py` fetches RBA cash rates plus ABS unemployment/building approvals (via `curl`) so fresh macro signals land in `data_stage/external_signals.parquet` with lags for production.
+> - Validation/run utilities moved under `tools/` (`time_split_validate`, `backfill_forecast_history`, etc.) and the docs site JSON is regenerated monthly (`docs/data/2025-01.json`…`2025-09.json`).
+> - Performance & tooling: JAX samplers for forecast, one‑click presets, DuckDB helpers, and BLAS/JAX env files (see below).
 
-### 2.3 Post-run publishing
+### Performance & Tooling (Sept 2025)
 
-1. **Calibration exports** – `python -m scripts.evaluate_calibration --month <latest>` populates tiered alert CSV/JSON in `outputs/tables/`.  
-2. **Static site deploy** – `netlify deploy --dir=docs --prod` (or run `scripts/monthly_job.sh`).  
-3. **Log the run** – Append sampler diagnostics & highlights in [docs/EXPERIMENT_LOG.md](docs/EXPERIMENT_LOG.md) if metrics change and capture sparse-SA2 bias shifts.
+- JAX samplers (forecast): `src/models/forecast.py` now supports `--sampler {pymc,blackjax,numpyro}`, `--target-accept`, and `--init`. Divergence count is printed after sampling.
+- One-click presets: `python -m src.cli one-click -- --preset {fast,balanced,heavy}` and `--refit-nowcast`.
+  - fast: cached nowcast, 1×200 samplers
+  - balanced (default): includes 2023 in train, 2×800, GBM+Bayes
+  - heavy: refits nowcast, BlackJAX, 4×1500, `target_accept=0.995`
+- Recency weighting: forecasts default to a 12-month half-life (`FORECAST_RECENCY_HALFLIFE`); pass `--no-recency-weights` in `src/models/forecast.py` or `tools/time_split_validate.py` to treat historical months uniformly.
+- Environments (BLAS/JAX ready):
+  - Conda/mamba: `environment.yml` → `mamba env create -f environment.yml && mamba activate wa-rental-pipeline`
+  - Pixi: `pixi.toml` → `pixi install` then `pixi run one_click`
+- DuckDB helper: `src/common/duck.py` with `scan_stage()` and `ddb_query()` for fast Parquet SQL over `data_stage/`.
+  - Example:
+    ```py
+    from src.common.duck import ddb_query, scan_stage
+    q = (
+        "SELECT month, AVG(price_pressure_prob) AS p "
+        "FROM " + scan_stage('price_pressure_forecast_sa2_history.parquet') + " "
+        "GROUP BY month ORDER BY month"
+    )
+    df = ddb_query(q)
+    ```
+  - Pipeline artifact: `python -m tools.duck_summary` writes `outputs/tables/wa_monthly_prob_summary.csv`.
 
-### 2.4 Day-zero triage (before data drop)
+## Table of contents
 
-- Refresh external signals (`python -m src.data_ingest.external_signals`).  
-- Inspect `outputs/tables/worst_underpredictions_*.csv` for any SA2 outside the sparse cohort needing ad-hoc investigation.  
-- Queue feature experiments via `tools/time_split_validate.py` with custom flags (see §4).
-
----
-
-## 3. Default Configuration Snapshot (as of October 2025)
-
-| Setting | Default | Where | Notes |
-|---------|---------|-------|-------|
-| Training window | 2023-03 → month before validation start | `Makefile` | `VAL_END` auto-resolves to previous month; `VAL_START` is rolling 6 months; `TRAIN_END` backs off one month. |
-| Chains × cores | `CHAINS=6`, `CORES=6` | `Makefile`, `scripts/run_time_split_calibrated.sh` | Saturates typical 12-thread boxes; adjust per hardware. |
-| Draws / Tune | `DRAWS=1800`, `TUNE=1800` | Same | Aligns with ID8/ID9 experiments. |
-| Target accept | `TARGET_ACCEPT=0.995` | Same | Stabilises heavy tails post lodgement-smoothing. |
-| Calibration | `--calibrate-isotonic`, `CALIB_USE_RAW=1` | Makefile & scripts | Raw-prob isotonic, applied both OOS validation and latest forecast. |
-| Feature toggles | `--with-external --extra-features --with-spatial --walk-forward` | Makefile | Brings in macro signals, WA aggregates, adjacency averages. |
-| Sparse-market extras | Enabled by default | `src/models/forecast.py` | Lodgement scarcity ratios, rolling spike magnitudes, thin-market interactions, booster logit. |
-| Booster | On (`SPARSE_MARKET_BOOSTER=1`) | Forecast build | GradientBoostingClassifier (300 trees, depth≤3) feeding `booster_logit`; disable with env var for A/B comparisons. |
-| Lodgement weighting | `LODGE_SMOOTHING=12`, `LODGE_WEIGHT_FLOOR=0.05` | Forecast env | Down-weights months with few lodgements. |
-
-Override any of these on the command line, e.g. `make fit_latest DRAWS=1200 CORES=8`.
-
----
-
-## 4. Diagnostics, Experiments & Sparse-SA2 Toolkit
-
-- **Sparse SA2 dashboard** – `tools/sparse_sa2_diagnostic.py` (see §2.1) summarises bias, lodgement coverage, and rent shocks; outputs land in `outputs/tables/sparse_sa2_*`. Use before/after refits.
-- **Time-split validator** – `tools/time_split_validate.py` is the canonical way to compare configurations. Key flags extracted from production runs:  
-  `--sampler-rhat-max 1.01 --sampler-retries 2 --retry-draw-multiplier 1.5` keep R-hat in check; `--threshold-grid 0.01 0.02 0.03` writes multi-threshold histories for evaluation.
-- **Experiment log** – Update [docs/EXPERIMENT_LOG.md](docs/EXPERIMENT_LOG.md) after each heavyweight run. Entry ID9 captures the sparse-market booster; use the same format to add future experiments.
-- **Report archive** – `docs/reports/2025-10-15_lodgement_weighting.md` documents the supply-shock + lodgement weighting changes rolled into the current defaults. Add new reports here for major refactors.
-
----
-
-## 5. Quick Start & Environment Setup
-
-### Option A — Python virtualenv (recommended)
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
-```
-
-### Option B — Conda/Mamba (for optimised BLAS)
-```bash
-mamba create -n wa-rental-forecast python=3.12 pymc arviz pytensor pandas numpy \
-  pyarrow geopandas pyogrio shapely folium branca matplotlib requests tqdm openpyxl
-mamba activate wa-rental-forecast
-```
-
-> If PyTensor warns about BLAS, Conda/Mamba builds usually resolve it automatically.
-
-Activate the chosen environment before running any `make` targets or scripts.
+- [Project goals](#project-goals)
+- [Pipeline overview](#pipeline-overview)
+- [Repository layout](#repository-layout)
+- [Data sources](#data-sources)
+- [Install & setup](#install--setup)
+- [Configuration](#configuration)
+- [How to run](#how-to-run)
+- [Outputs](#outputs)
+- [Models](#models)
+- [Evaluation & back‑testing](#evaluation--back-testing)
+- [Website (static site + Netlify)](#website-static-site--netlify)
+- [Automation (cron / WSL)](#automation-cron--wsl)
+- [Performance tips](#performance-tips)
+- [Troubleshooting](#troubleshooting)
+- [Roadmap / ideas](#roadmap--ideas)
+- [License & acknowledgements](#license--acknowledgements)
+- [Time‑Split & Walk‑Forward](#time-split--walk-forward)
+- [External signals (APIs)](#external-signals-apis)
 
 ---
 
-## 6. Pipeline Overview & Repository Layout
+## Project goals
 
-### Project goals
 - **Nowcast**: estimate current **rental availability** (tightness) for each SA2 in WA.  
-- **Forecast**: probability that **next month’s median rent** increases by **> 2 %** (configurable).
+- **Forecast**: probability that **next month’s median rent** increases by **> 2%** (configurable).
 
-Monthly deliverables:
+Deliverables each month:
 - **Top‑20 risers CSV**
 - **Interactive SA2 map** (folium HTML)
 - **Static bar chart PNG**
 - **Spreadsheet of all SA2 probabilities** (with SA2 names)
-- **Evaluation files** after the next month’s data arrives (AUC/Brier/Calibration)
+- **Evaluation files** once the next month’s data arrives (AUC/Brier/Calibration)
 
-### Pipeline overview
+---
+
+## Pipeline overview
+
 ```
 AHDAP Bonds ZIPs ─┐
                    ├─> fetch_bonds.py ─> process_bonds.py ──┐
@@ -136,7 +107,7 @@ ABS SA2 GeoPackage ────────────────────�
                          ↓
    data_stage/availability_nowcast_sa2.parquet
                          ↓
-           models/forecast.py (hier. logistic + sparse-market booster)
+           models/forecast.py (hier. logistic)
                          ↓
    data_stage/price_pressure_forecast_sa2.parquet
                          ↓
@@ -146,10 +117,13 @@ ABS SA2 GeoPackage ────────────────────�
       ├─ outputs/reports/map_price_pressure.html
       ├─ outputs/figures/top20_pressure_risers.png
       ├─ outputs/evaluations/forecast_eval_summary.csv (once actuals exist)
-      └─ outputs/figures/forecast_calibration_YYYY-MM.png (once actuals exist)
+      └─ outputs/figures/forecast_calibration_YYYY‑MM.png (once actuals exist)
 ```
 
-### Repository layout
+---
+
+## Repository layout
+
 ```
 src/
   config.py                   # Paths/thresholds/seeds; edit here
@@ -179,151 +153,650 @@ src/
 scripts/
   monthly_job.sh              # Activates venv, runs pipeline + evaluation, logs
 
-tools/
-  time_split_validate.py      # Walk-forward validator (heavy runs)
-  sparse_sa2_diagnostic.py    # New thin-market bias diagnostics
-  backfill_forecast_history.py, export_* utilities, etc.
-
-docs/
-  data/                       # Static site payloads (monthly JSON, thresholds)
-  reports/                    # Deep-dive write-ups (lodgement weighting, …)
-  CODEMAP.md, DATA_DICTIONARY.md, EXPERIMENT_LOG.md
-
-data_raw/                     # (ignored) AHDAP ZIPs, ABS GeoPackage, correspondences
+tools/                        # Diagnostics & utilities (time_split_validate, etc.)
+docs/                         # (committed) Static site (index.html, data/, geojson)
+data_raw/                     # (ignored) AHDAP ZIPs, ABS GeoPackage, ABS correspondence
 data_stage/                   # (ignored) parquet intermediates
 outputs/                      # (ignored) generated artifacts (tables/figures/reports/...)
 ```
 
-> **Keep the repo light.** `.gitignore` excludes all `data_*` directories and `outputs/`; never commit raw data or generated artifacts.
+> **Keep the repo small.** Don’t commit `data_*` or `outputs/`. The `.gitignore` below handles this.
 
 ---
 
-## 7. Data Sources
+## Data sources
 
 - **WA Rental Bonds** (AHDAP CKAN): monthly lodgements, disposals, bonds held.  
-- **ABS POA→SA2 correspondence (2021)**: population-weighted allocation ratios.  
+- **ABS POA→SA2 correspondence (2021)**: population‑weighted allocation ratios.  
 - **ABS ASGS 2021 SA2 GeoPackage**: geometries & names for SA2s.
 
 Place these in `data_raw/`:
+
 ```
 data_raw/
   <AHDAP_SLUGS.../ZIPs...>
   ASGS_2021_SA2.gpkg
-  CG_POA_2021_SA2_2021.xlsx   # or the ABS mega-ZIP containing it
+  CG_POA_2021_SA2_2021.xlsx   # (or the ABS mega‑ZIP containing it)
 ```
-`data_ingest/map_poa_sa2.py` handles CSV/Excel/mega-ZIP edge cases.
+
+`data_ingest/map_poa_sa2.py` is robust to:
+- CSV or Excel,
+- **or** the **ABS mega‑ZIP** mis‑saved as `.xlsx` (common!) — it will open the inner correspondence.
 
 ---
 
-## 8. Commands & Shortcuts
+## Install & setup
 
-### CLI & orchestration
-- `python -m src.cli one-click` — preferred end-to-end pipeline.
-- `python -m src.cli run-all` — compatibility runner; see [docs/CODEMAP.md](docs/CODEMAP.md) for flow.
-
-### Makefile (after activating venv)
+### Option A — Python venv
 ```bash
-make fit_latest                                # heavy walk-forward + calibration (defaults described in §3)
-make eval_recent START=2025-08 END=2025-09     # score a custom window
-make site                                       # regenerate docs/
-make all_monthly                                # fit → eval (last 2 months) → site → tiered alerts
-make pr_months MONTHS="2025-07 2025-08"    # Average Precision per month
-make serve PORT=8081                            # serve docs/ locally
-make alerts_top20 THR=0.30 MONTH=2025-09        # export fixed-threshold alert list
-make alerts_best MONTH=2025-09                  # export best-threshold alert list
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
 ```
 
-### Scripts & utilities
-- `python -m tools.time_split_validate --help` — full list of validation flags.  
-- `python -m tools.export_alerts` / `tools.export_alerts_best` — CSV exports for alerting workflows.  
-- `python -m scripts.evaluate_calibration --month YYYY-MM` — writes calibrated probabilities and tiered alerts.  
-- `python -m tools.model_experiments` — sandbox for logistic vs gradient-boost experiments.  
-- `python tools/sparse_sa2_diagnostic.py` — sparse SA2 bias deep dive (plots + tables).
+### Option B — Conda/Mamba (faster PyMC sampling)
+```bash
+mamba create -n wa-rental-forecast python=3.12 pymc arviz pytensor              pandas numpy pyarrow geopandas pyogrio shapely folium branca matplotlib requests tqdm openpyxl
+mamba activate wa-rental-forecast
+```
+
+> If you see a **BLAS** warning from PyTensor, Conda/Mamba builds usually fix it automatically.
 
 ---
 
-## 9. Outputs & Interpretation
+## Configuration
 
-Key artifacts (all ignored by git):
-- `outputs/tables/top20_pressure_risers.csv` — Top‑20 SA2s by probability.  
-- `outputs/tables/price_pressure_forecast_sa2_latest[_named].xlsx` — Latest probabilities (code-only and name-labelled).  
-- `outputs/reports/map_price_pressure.html` — Interactive folium map.  
-- `outputs/figures/top20_pressure_risers.png` — Static bar chart.  
-- `outputs/evaluations/forecast_eval_summary.csv` — Month-level metrics (AUC, Brier, log-loss, precision/recall).  
-- `outputs/evaluations/forecast_eval_details_YYYY-MM.csv` — Row-level truth vs probability.  
-- `outputs/figures/forecast_calibration_YYYY-MM.png` — Calibration curve.  
-- `outputs/tables/alerts_tiers_YYYY-MM*.csv/json` — Calibrated alert lists (critical/high/medium).  
-- `outputs/tables/sparse_sa2_summary.csv`, `outputs/tables/sparse_sa2_timeseries.csv` — Thin-market diagnostics.  
-- `outputs/figures/sparse_sa2_*.png` — Per-SA2 diagnostic charts.
+All paths & constants live in `src/config.py`. Key settings:
 
-**Interpretation**: a forecast value of **0.82** means an 82 % chance that next month’s median rent in that SA2 rises by more than 2 %.
+- **Directories**: `RAW_DIR`, `STAGE_DIR`, `OUT_DIR`, `FIG_DIR`, `REPORT_DIR`  
+- **ABS assets**:
+  - `ASGS_SA2_GPKG = data_raw/ASGS_2021_SA2.gpkg`
+  - `POA_SA2_CORRESP = data_raw/CG_POA_2021_SA2_2021.xlsx`
+- **Model**:
+  - `RENT_GROWTH_THRESHOLD = 0.02`  *(2% default threshold for a “rise”)*
+  - `RANDOM_SEED = 42`
+- **Map performance**:
+  - `validate_and_report.py` simplifies geometries in meters for faster HTML.
 
 ---
 
-## 10. Model Architecture Highlights
+## How to run
+
+## Lean Core vs Optional
+
+- Core (src/): data_ingest/process_bonds → data_ingest/map_poa_sa2 → models/nowcast → models/forecast → reporting/validate_and_report → reporting/build_site → reporting/evaluate_forecasts
+- Utilities (tools/): time_split_validate, backfill_forecast_history, scan_wa_bonds_zip
+
+Run the full pipeline: `python -m src.cli one-click`
+
+
+### End‑to‑end (one‑off)
+```bash
+# from repo root
+python -m src.cli run-all
+python -m src.reporting.validate_and_report
+python -m src.reporting.evaluate_forecasts  # writes spreadsheets; scores if actuals exist
+```
+
+### Individual steps (iterate)
+```bash
+python -m src.data_ingest.fetch_bonds
+python -m src.data_ingest.process_bonds
+python -m src.data_ingest.map_poa_sa2
+python -m src.models.nowcast
+python -m src.models.forecast
+python -m src.reporting.validate_and_report
+python -m src.reporting.evaluate_forecasts
+```
+
+### Makefile shortcuts (recommended)
+
+Common tasks are wrapped in a Makefile:
+
+```bash
+# Fit latest with recency=6, bias-correct, isotonic calibration, prior-shift
+make fit_latest
+
+# Evaluate a window (e.g., the last two months)
+make eval_recent START=2025-07 END=2025-08
+
+# Rebuild the static site (writes docs/)
+make site
+
+# One-click monthly: fit → eval last 2 months → build site
+make all_monthly
+
+# Print Average Precision for months (requires sklearn)
+make pr_months MONTHS="2025-07 2025-08"
+
+# Serve the site locally at http://localhost:8081 (PORT overridable)
+make serve
+
+# Export Top‑20 alerts for a month at a fixed threshold (default latest, THR=0.34)
+make alerts_top20 THR=0.30 MONTH=2025-09
+
+# Export Top‑20 alerts at the monthly best threshold (from evaluation summary)
+make alerts_best MONTH=2025-08
+```
+
+### Multi-threshold accuracy (stacked pipeline)
+
+When you want the stacked GBM+Bayes workflow (time-split + calibration + bias correction) for several rent thresholds at once, run the time-split validator with a threshold grid. The new sampler guards auto-retry long runs until rank-based R-hat ≤ 1.01.
+
+```bash
+PYTENSOR_FLAGS="blas__ldflags=-L/usr/lib/x86_64-linux-gnu -lopenblas" \
+  .venv/bin/python -m tools.time_split_validate \
+    --train-start 2024-03 --train-end 2025-02 \
+    --val-start 2025-03   --val-end   2025-08 \
+    --threshold-grid 0.01 0.02 0.03 \
+    --draws 1200 --tune 1200 \
+    --chains 8 --cores 8 \
+    --recency-half-life 6 \
+    --with-external --extra-features --with-spatial \
+    --walk-forward \
+    --pymc-target-accept 0.995 \
+    --sampler-rhat-max 1.01 \
+    --sampler-retries 2 \
+    --retry-draw-multiplier 1.5
+```
+
+The command writes `data_stage/price_pressure_forecast_sa2_history_thr0p010.parquet`, `..._thr0p020.parquet`, and `..._thr0p030.parquet`. Score each history (and regenerate spreadsheets) with:
+
+```bash
+.venv/bin/python -m src.reporting.evaluate_forecasts --threshold 0.01
+.venv/bin/python -m src.reporting.evaluate_forecasts --threshold 0.02
+.venv/bin/python -m src.reporting.evaluate_forecasts --threshold 0.03
+```
+
+Tip: on machines with ≥16 cores, either keep `--chains 8 --cores 8` or launch the thresholds in parallel shells so the sampler saturates more CPU.
+
+See also: [September 2025 threshold diff](docs/data/2025-09_threshold_diff.md) for side-by-side comparisons of the original 2 % release versus the new 1 %/2 %/3 % runs.
+
+### Operational guidance
+
+- Thresholds: use the per‑month `best_thr_f1` from `outputs/evaluations/forecast_eval_summary.csv` for alerts instead of a fixed 0.50. The site and JSON exports include these alerts.
+- Calibration: enable isotonic calibration to tighten Brier/log‑loss. Validation supports `--calibrate-isotonic`, and the latest forecast supports `--calibrate-isotonic` as well.
+- Recency: default `recency_half_life=6` (also in `src/one_click.py`) emphasizes recent dynamics and improved late‑month performance.
+- Prior‑shift: `src.models.forecast` supports `--prior-shift` to align logits to recent base rates (env `PRIOR_MONTHS`, default 3). Combine with isotonic.
+
+### New evaluation outputs
+
+`src.reporting.evaluate_forecasts` now also writes:
+- Expected Calibration Error (`ece`) and Brier decomposition (`brier_reliability`, `brier_resolution`, `brier_uncertainty`) into `forecast_eval_summary.csv`.
+- Precision‑Recall curves with Average Precision (PNG per month) into `outputs/figures/`.
+
+### Site improvements
+
+- The site JSON (docs/data/YYYY‑MM.json) includes an alert flag `a` per SA2 based on the monthly best threshold; the map UI supports an “Alerts only” toggle.
+- The footer shows AUC, Brier, LogLoss, and the monthly threshold.
+
+> When everything is wired, outputs land under `outputs/`:
+> - `outputs/tables/price_pressure_forecast_sa2_latest.xlsx`
+> - `outputs/tables/price_pressure_forecast_sa2_latest_named.xlsx`  
+> and after the next data drop: `outputs/evaluations/forecast_eval_*` files.
+
+---
+
+## Outputs
+
+- `outputs/tables/top20_pressure_risers.csv` – Top‑20 SA2 codes by probability.  
+- `outputs/tables/price_pressure_forecast_sa2_latest.xlsx` – All SA2s (code, month, probability).  
+- `outputs/tables/price_pressure_forecast_sa2_latest_named.xlsx` – Same + **SA2 names**.  
+- `outputs/reports/map_price_pressure.html` – Interactive SA2 map (fast, simplified geometries).  
+- `outputs/figures/top20_pressure_risers.png` – Static bar chart (top‑20).  
+- **After actuals exist** (next month):  
+- `outputs/evaluations/forecast_eval_summary.csv` – AUC, Brier, log-loss by month.  
+- `outputs/evaluations/forecast_eval_details_YYYY‑MM.csv` – Row-level truth vs prob.  
+- `outputs/evaluations/forecast_calibration_YYYY‑MM.csv` & `outputs/figures/forecast_calibration_YYYY‑MM.png`.
+- `outputs/evaluations/forecast_calibration_clusters.csv` – calibration summary by price-based cluster (model-derived quintiles).
+
+**Interpretation**: A value of **0.82** means an **82%** chance that next month’s median rent for that SA2 rises by **> 2%**.
+
+---
+
+## Models
 
 ### Nowcast (`src/models/nowcast.py`)
-- Negative Binomial on disposals with `log(stock_bonds)` exposure.  
-- SA2 random intercepts, linear trend, seasonality (sum-to-zero), overdispersion `alpha_nb`.  
-- Outputs posterior mean `availability_rate`.
+- **Likelihood**: Negative Binomial over **disposals** (ended tenancies).  
+- **Offset**: `log(stock_bonds)` (exposure), so the expected count scales with stock.  
+- **Structure**:
+  - SA2 random intercepts (hierarchical pooling)
+  - Linear time trend
+  - Month‑of‑year seasonality (sum‑to‑zero)
+  - Overdispersion parameter `alpha_nb`
+- **Output**: `availability_rate` = posterior mean of expected count per unit stock.
 
 ### Forecast (`src/models/forecast.py`)
-- Logistic model on `1{Δ median_rent_{t+1} > g}`, `g=0.02` by default.  
-- Feature set includes availability/churn/momentum, WA-demeaned variants, interactions, calendar, lags, external signals, neighbour availability, **plus sparse-market features** (lodgement scarcity ratios, recent spike magnitudes, thin-market indicators) and a **GradientBoostingClassifier booster logit**.  
-- Hierarchical structure: SA2 random intercepts, mild varying slopes (availability, churn, price band, rent momentum), month-level random effects, price-cluster effect.  
-- Lodgement-aware smoothing shrinks volatility features when coverage is thin; lodgement weights also influence pseudo-observations.  
-- Optional prior-shift and bias correction; isotonic calibration applied when history exists.  
-- Writes posterior summaries and `outputs/evaluations/forecast_training_metrics.json` (threshold sweep, calibration diagnostics).
+- **Target**: `1{ Δ median_rent_{t+1} > g }`, where `g = 2%` (configurable).  
+- **Predictors** (standardized):
+  - Core: `availability_rate`, `churn_rate`, `rent_mom_1m`, `rent_mom_3m`
+  - **WA-demeaned variants**: (`*_wa_dev`) capture how far each SA2 sits from the statewide monthly mean.
+  - **Interaction terms**: `availability_rate × rent_mom_1m`, `availability_rate × churn_rate`, `churn_rate × rent_mom_3m` highlight compounding pressure.
+  - Calendar, lags, external signals, neighbour availability (when present).
+- **Structure**:
+  - Logistic regression with **SA2 random intercepts** + mild varying slopes for key drivers.
+  - Automatic isotonic calibration (when sufficient realised history exists), optional prior-shift and bias correction.
+- **Outputs**:
+  - `price_pressure_prob` per SA2 (latest month) with posterior intervals.
+  - `outputs/evaluations/forecast_training_metrics.json` summarising training AUC/PR and the recommended operating threshold (max F1 over 0.05–0.95 grid).
 
-Detailed feature descriptions live in [docs/DATA_DICTIONARY.md](docs/DATA_DICTIONARY.md); architectural context is in [docs/CODEMAP.md](docs/CODEMAP.md).
-
----
-
-## 11. Evaluation & Back-testing
-
-`src.reporting.evaluate_forecasts` builds realised labels once next-month data is available and scores each month (AUC, Brier, log-loss, precision/recall). It also produces:  
-- Expected Calibration Error (ECE) and Brier decomposition fields (`brier_reliability`, `brier_resolution`, `brier_uncertainty`).  
-- Precision–Recall curves stored under `outputs/figures/`.  
-- Threshold recommendations (`best_thr_f1`) consumed by alert exports and site JSON.
-
-For multi-threshold analysis, run `tools.time_split_validate.py` with `--threshold-grid` and rescore each history using `src.reporting.evaluate_forecasts --threshold <g>`.
+> **Extensions** (easy, optional): add supply-side signals (approvals, completions) to `external_signals.parquet`—they automatically propagate through the feature builder.
 
 ---
 
-## 12. Automation & Hosting
+## Evaluation & back‑testing
 
-- **Netlify deploy**: `scripts/monthly_job.sh` automates venv activation → pipeline → evaluation → site build → optional Netlify CLI deploy. Example cron entry (07:30 on the 5th):  
-  `30 7 5 * * /home/<you>/projects/wa_rental_pressure/scripts/monthly_job.sh`
-- **Logs**: `outputs/logs/run_all_<timestamp>.log` (ensure cron PATH includes the Netlify CLI).  
-- **Credentials**: Run `netlify login` interactively once or set `NETLIFY_AUTH_TOKEN` for headless environments.
+`src/reporting/evaluate_forecasts.py` automatically:
+- Builds **realized labels** when the next month’s SA2 panel is available.
+- Scores predictions month‑by‑month: **AUC**, **Brier**, **log‑loss**, precision/recall at 0.5.
+- Adds skill/error metrics:
+  - **MASE** vs baselines: `mase_vs_seasonal` (t−12), `mase_vs_locf` (t−1)
+  - **Brier Skill Score** vs both baselines: `bss_vs_seasonal`, `bss_vs_locf`
+  - **WA‑weighted errors** (by `stock_bonds`): `w_mae`, `w_rmse`
+- Writes a **calibration plot** (predicted vs observed probability).
 
----
-
-## 13. Troubleshooting & Performance Tips
-
-- **PyMC / PyTensor**: For verbose diagnostics, `export PYTENSOR_FLAGS="optimizer=fast_compile,exception_verbosity=high"`. Set `PYTENSOR_FLAGS="${PYTENSOR_FLAGS},base_compiledir=./.pytensor"` if cache permissions trip up.
-- **Sampler instability**: Lower draws/tune or raise `target_accept` if divergences persist; `tools/time_split_validate.py` already retries with larger draw counts when `rhat > 1.01`.
-- **Availability cache**: The validator reuses `data_stage/availability_nowcast_sa2.parquet`. Delete it to force a refit with new features.
-- **Geometry issues**: `src.reporting.build_site` simplifies GeoJSON in meters; adjust tolerance inside the script if maps load slowly.  
-- **Map metrics stuck at 0.500 cutoff**: the site builder now recomputes per-month best-F1 thresholds from the joined predictions/actuals whenever the evaluation summary is missing a month, so a full `make site` rebuild will refresh the JSON with the correct cutoff and metrics once actuals arrive.
-- **Crosswalk quirks**: `data_ingest/map_poa_sa2.py` opens mega-ZIPs masquerading as `.xlsx`; inspect logs for `poa=… sa2=… ratio=…` if mapping looks off.
-
-More tips and open ideas reside in the **Performance tips** and **Roadmap** sections of [docs/CODEMAP.md](docs/CODEMAP.md) and [TODO.md](TODO.md).
+Until the next month’s panel exists, it will print:  
+**“No realized months yet to score.”** (expected)
 
 ---
 
-## 14. Next Steps & Research Backlog
+## Time‑Split & Walk‑Forward
 
-Immediate items from [TODO.md](TODO.md) (keep this synced when priorities change):
-- Investigate chronic underpredictions (Roebourne, Gnowangerup, Morawa, City Beach); augment sparse-market features with additional shock signals.  
-- Prototype adaptive recency weighting or change-point detection to react faster to regime shifts.  
-- Refit September 2025 with supply-shock + lodgement weighting so site/export JSON reflect improved calibration.  
-- Surface tiered alert CSVs on the Netlify site and wire into alerting workflow.  
-- Automate residual dashboards fed by `outputs/tables/merged_predictions_full_YYYY-MM.csv`.  
-- Explore region-level pooling / booster blends for thin-data SA2s; evaluate sparsity-aware random effects.
+This repo includes a helper to train on an early block of months and validate on later months using a strict split (no leakage), plus an optional walk‑forward variant that refits per target month.
 
-Keep this section current—if a task moves to "done" or a new one emerges, update both [TODO.md](TODO.md) and the experiment log entry referencing it.
+Prerequisites: run up to SA2 staging so `data_stage/bonds_panel_sa2.parquet` covers the period of interest.
+
+```
+python -m src.data_ingest.fetch_bonds
+python -m src.data_ingest.process_bonds
+python -m src.data_ingest.map_poa_sa2
+```
+
+Example: Train on Jan–Apr, validate on Jun–Sep
+
+1) Fixed split (single fit):
+```
+python -m tools.time_split_validate \
+  --train-start 2025-01 --train-end 2025-04 \
+  --val-start 2025-06 --val-end 2025-09
+  --draws 400 --tune 400 --chains 1 --cores 1
+```
+This:
+- Fits the Negative Binomial nowcast on Jan–Apr and predicts out‑of‑sample `availability_rate` for the base months (May–Aug).
+- Fits the logistic forecast on Jan–Apr and produces probabilities for the target months (Jun–Sep).
+- Appends predictions to `data_stage/price_pressure_forecast_sa2_history.parquet`.
+
+2) Walk‑forward (operational realism):
+```
+python -m tools.time_split_validate \
+  --train-start 2025-01 --train-end 2025-04 \
+  --val-start 2025-06 --val-end 2025-09 \
+  --walk-forward \
+  --draws 400 --tune 400 --chains 1 --cores 1
+```
+For each target month T in Jun..Sep, this refits:
+- Nowcast on all data up to and including T−1 (to estimate availability for base month T−1);
+- Logistic on months from Jan up to T−2 (so labels do not use information at T).
+
+Evaluate just these months (once actuals exist for each):
+```
+python -m src.reporting.evaluate_forecasts --start 2025-06 --end 2025-09
+```
+Rebuild the static site (adds/updates docs/data/*.json):
+```
+python -m src.reporting.build_site
+```
+
+Extras (feature switches):
+- `--with-external`: merge monthly external signals (from `data_stage/external_signals.parquet`).
+- `--extra-features`: add calendar features and simple lags.
+- `--with-spatial`: include neighbor‑mean availability `nbr_availability_rate` (see below).
+- `--leakage-canary`: permute train labels; metrics should collapse if there’s no leakage.
+- `--recency-half-life 12`: up‑weight recent months (half‑life = 12 months) in both fits.
 
 ---
 
-Need help? Ping the experiment history ([docs/EXPERIMENT_LOG.md](docs/EXPERIMENT_LOG.md)) for precedent configurations before changing defaults, and log every production run there to keep this README accurate.
+## Website (static site + Netlify)
+
+The repo contains a generator that builds a static site into **`docs/`**:
+
+```bash
+python -m src.reporting.build_site
+# Produces:
+# docs/index.html
+# docs/sa2_wa_simplified.geojson
+# docs/data/thresholds.json
+# docs/data/<threshold_id>/months.json
+# docs/data/<threshold_id>/YYYY-MM.json (per-month payloads)
+# docs/data/<threshold_id>/summary.json (metrics per month once actuals exist)
+# docs/data/months.json + docs/data/summary.json (legacy copies for the default threshold)
+```
+
+You can open locally:
+```bash
+python -m http.server --directory docs 8000
+# then visit http://localhost:8000
+```
+
+**Deploy to Netlify (recommended, no server required):**
+```bash
+# one-time
+npm i -g netlify-cli
+netlify login
+netlify link  # select your wa-rental-forecast site, or use: netlify link --id <API_ID>
+
+# build + deploy
+python -m src.reporting.build_site
+netlify deploy --dir=docs --prod
+```
+
+Optional `docs/_headers` (cache hints):
+```
+/index.html
+  Cache-Control: no-cache
+
+/sa2_wa_simplified.geojson
+  Cache-Control: public, max-age=31536000, immutable
+
+/data/*
+  Cache-Control: public, max-age=3600
+```
+
+### Map thresholds, metrics & legend
+
+- Event threshold selector: choose between the 1 %, 2 %, and 3 % rent-jump definitions that we evaluate in walk-forward validation. The default view is ≥ 2 % to match production.
+- Forecast probability: colors interpolate from light yellow (0) to deep red (1) to show Pr[Δrent > selected threshold].
+- Actual outcome: red = rise above the threshold, green = not rise, grey = n/a (no realized data yet).
+- Model correctness: uses the per-month best-F1 probability cutoff surfaced in `summary.json`; green = prediction matches actual, red = mismatch, grey = n/a. This replaces the earlier fixed 0.60 cutoff.
+- Error (prob − actual) and |prob − actual| views remain available for quick calibration sweeps.
+
+Note: footer metrics (precision/recall/accuracy) reflect the same best-F1 operating threshold that drives the correctness view. Accuracy at the legacy 0.50 cutoff is still exported in the summary JSON for tooling that needs it.
+
+### Validation options (quick wins)
+
+- `--leakage-canary`: permutes train labels inside each fold; metrics should collapse if there’s no leakage.
+- `--extra-features`: adds calendar features (mo_sin/mo_cos, quarter, EOFY, uni semester flags) and simple lags
+  (`availability_rate_lag1`, `churn_rate_lag1`, `rent_mom_12m`).
+- `--recency-half-life <months>`: up-weights recent months in both the nowcast and forecast fits
+  via a half-life schedule (e.g., 12 → weights halve every 12 months).
+
+CLI flags are also available on:
+
+```bash
+# Optional recency weighting during one-shot fits
+python -m src.models.nowcast --recency-half-life 12
+python -m src.models.forecast --recency-half-life 12
+```
+
+Spatial feature option (neighbor mean availability):
+```bash
+python -m tools.time_split_validate \
+  --train-start 2025-01 --train-end 2025-04 \
+  --val-start 2025-06 --val-end 2025-09 \
+  --with-spatial
+```
+
+Neighbor feature details:
+- `nbr_availability_rate` is the mean of neighboring SA2s’ `availability_rate` for the same month (queen adjacency).
+- Uses the same‑month availability from the nowcast/prediction for base months, so there’s no label leakage.
+
+### TODO: Precision & Recall Enhancements
+
+- **Threshold tuning:** Explore per-month or per-segment operating thresholds (e.g., percentile-based cuts, cost-sensitive Fβ) beyond the current global best-F1 selection.
+- **Feature enrichment:** Prototype additional supply-demand features (vacancy data, time-on-market proxies, listings velocity) that could lift recall without sacrificing precision.
+- **Calibration audits:** Re-run isotonic/Platt calibration sweeps on the longer training window to reduce mid-probability overconfidence visible in calibration plots.
+- **Ensemble blending:** Evaluate stacking strategies that weight GBM vs Bayesian components differently for low-prevalence months to recover missed positives.
+- **Label quality checks:** Investigate rent-change volatility around reporting cutoffs (e.g., end-of-quarter effects) to ensure the 1 %/2 %/3 % labels aren’t introducing noise that caps precision.
+- Build adjacency once with `python -m tools.spatial_features` or let the validator auto‑create it on first run.
+
+---
+
+## Automation (cron / WSL)
+
+Use `scripts/monthly_job.sh` to run the full pipeline and publish the site. Example crontab (7:30 on the 5th each month):
+
+```
+30 7 5 * * /home/<you>/projects/wa_rental_pressure/scripts/monthly_job.sh
+```
+
+The script does:
+1) Activate venv  
+2) `src.cli.commands.run_all` → `src.reporting.evaluate_forecasts`  
+3) `src.reporting.build_site`  
+4) `netlify deploy --dir=docs --prod` (if the CLI is available)
+
+Logs are written to `outputs/logs/run_all_<timestamp>.log`.
+
+Cron tips:
+- PATH: cron often lacks `/usr/local/bin` (where `netlify` lives). The script now exports a safe PATH; alternatively set in crontab: `PATH=/usr/local/bin:/usr/bin:/bin`.
+- Netlify auth: ensure you’ve run `netlify login` under the same user so cron inherits credentials. For headless servers, set `NETLIFY_AUTH_TOKEN` in the crontab env.
+- Debugging: check the latest `outputs/logs/run_all_*.log` for lines showing `which netlify` and the deploy command.
+
+---
+
+## Performance tips
+
+- **Map speed**: geometries are simplified in meters for the folium map and for the static site; increase the tolerance for smaller files.  
+- **Sampling speed**: consider a Conda/Mamba environment for optimized BLAS; or reduce `draws`/`tune` for dev runs.
+- **Sampler guard rails**: `tools.time_split_validate` and `src.models.forecast` accept `--sampler-rhat-max`, `--sampler-retries`, and `--retry-draw-multiplier` so long runs automatically re-sample until rank R-hat drops beneath the tolerance (default 1.01).
+- **CPU saturation**: raise `--chains`/`--cores` (e.g., 8×) or launch thresholds in parallel shells when running the multi-threshold grid so PyMC fills more cores.  
+- **Run‑time knobs** (safe defaults in code): `draws=1000`, `tune=1000`, `chains=4`, `target_accept=0.95`.
+
+---
+
+## Troubleshooting
+
+**Crosswalk parse errors**  
+- If the ABS correspondence is a **mega‑ZIP mis‑saved as .xlsx**, `data_ingest/map_poa_sa2.py` will detect it and open the inner file.  
+- If CSV has weird delimiters/encodings, the loader **sniffs** them.  
+- Script prints: `poa=... sa2=... ratio=... scale=ratio/percent rows=...`
+
+**Timestamp not JSON serializable**  
+- Fixed: the site builder strips/normalizes datetimes before serializing.
+
+**Folium map feels slow**  
+- Geometries are simplified in meters; raise tolerance for more speed/smaller HTML.
+
+**PyMC `MutableData` missing / BLAS warning**  
+- Not used: the models work with NumPy arrays (PyMC 5).  
+- BLAS warning = performance only; Conda builds usually resolve it.
+
+**PyTensor constant_folding / type errors during sampling**  
+- For detailed traces, set: `export PYTENSOR_FLAGS="optimizer=fast_compile,exception_verbosity=high"` and rerun.
+- Ensure the compile cache is writable: `export PYTENSOR_FLAGS="${PYTENSOR_FLAGS},base_compiledir=./.pytensor"`.
+- Use single-core dev settings while debugging: `--chains 1 --cores 1`.
+- The `src.cli.commands.one_click` entrypoint already sets `base_compiledir=./.pytensor` if not present.
+
+**Keep the repo small**  
+See `.gitignore` below; do **not** commit `data_*` or anything in `outputs/`.
+
+---
+
+## Roadmap / ideas
+
+- **Features**: `lodge_rate`, `stock_growth_1m`; seasonality in logistic.  
+- **Pooling**: SA3 random intercepts above SA2.  
+- **Calibration**: Platt/isotonic scaling if over/under‑confident.  
+- **Notifications**: Slack/Discord webhook summary after each run.  
+- **Distribution**: `environment.yml` for Conda users.
+
+## TODO (next run cycle)
+
+- **Calibration**: implement the rolling logit temperature + intercept calibrator (and isotonic-with-shrink fallback) on out-of-fold predictions; wire it into `validate_and_report.py` / `evaluate_forecasts.py` and select by time-series CV.
+- **Thresholds**: adopt a non-0.5 operating rule (default θ≈0.33 with ±0.03 guardrail) and add support for capacity-based top-k thresholds in the evaluation/export path.
+- **Temporal features & weights**: add recency/seasonality features (1- & 3-month deltas, month-of-year, time-since-spike) and time-decay sample weights before the next LightGBM fit.
+- **LightGBM retune**: rerun with higher capacity/regularisation (num_leaves=63, min_data_in_leaf=120, lambda_l2=10, feature_fraction/bagging_fraction=0.8, bagging_freq=5, rounds≈1200, early_stop≈200) under a rolling-origin CV scoring the last two months.
+- **Stacking**: refit the meta-learner on logit(p_pyMC), logit(p_LGBM) with a regularised logistic model, then pass its output through the chosen calibrator.
+- **Monitoring**: add monthly reliability/ECE charts, predicted vs observed prevalence plots, and precision/recall + alert counts at the production threshold so calibration drift is obvious.
+- Refresh macro parquet via `python -m src.data_ingest.external_signals` (or `bash scripts/fetch_abs_wa.sh`) before the next full pipeline run so the WA ABS feeds stay current.
+- Re-run `python -m src.cli one-click -- --recency-half-life 6 --calibrate-isotonic --prior-shift` to benchmark production accuracy with the new calibration + prior shift options enabled once the calibrators are in place.
+- Compare the updated metrics JSON against the previous release and capture any lift/bias notes in `docs/CODEMAP.md` or the evaluation notebook.
+
+---
+
+## License & acknowledgements
+
+- **Data**:  
+  - WA rental bonds via AHDAP Housing Data Exchange.  
+  - ABS ASGS 2021 SA2 geometries & POA→SA2 correspondence.  
+  Respect the licensing of each dataset when sharing outputs.
+
+- **Code**: choose a LICENSE (e.g., MIT) and place it in the repo root.
+
+---
+
+### One‑liner summary
+
+> **WA Rental Forecast** produces a monthly, SA2‑level map and ranked list of **where rents are most likely to jump next month**, then automatically checks how accurate it was when the next data drop arrives.
+
+---
+
+## External signals (APIs)
+
+You can augment the forecast with macro signals via APIs, with CSV fallbacks:
+
+- Supported signals (monthly):
+  - RBA target cash rate (parsed from RBA page; no key required)
+  - WA unemployment rate (ABS Data API SDMX‑JSON via curl helper)
+  - WA building approvals (ABS Data API SDMX‑JSON via curl helper)
+
+How it works:
+- `python -m src.data_ingest.external_signals` writes `data_stage/external_signals.parquet` with columns
+  `month`, `rba_cash_rate`, `wa_unemp_rate_sa`, `wa_build_approvals_num` (with lagged versions auto-added during modelling).
+- `scripts/external_signals.env.sample` documents API overrides; copy to `.env` or `scripts/external_signals.env` to customise.
+- `scripts/fetch_abs_wa.sh` is a CLI helper that materialises the same ABS series into CSV fallbacks under `data_raw/external/` (requires `curl` + `jq`).
+- `tools/time_split_validate.py` consumes the shared feature helpers and accepts `--with-external` so validation runs mirror production signals.
+
+API configuration (optional; ABS curl helper runs with sensible defaults):
+- Override ABS dataflow/key if you need a different series:
+  - `ABS_UNEMPLOYMENT_DATAFLOW` (default `LF`)
+  - `ABS_UNEMPLOYMENT_KEY` (default `M13.3.1599.20.5.M` → SA unemployment rate, Persons, Total age, WA)
+  - `ABS_UNEMPLOYMENT_START` (default `2010-01`)
+  - `ABS_BUILDAPP_DATAFLOW` (default `BA_GCCSA`)
+  - `ABS_BUILDAPP_KEY` (default `1.1.9.TOT.TOT.10.5.M` → Number of dwelling units, Total sectors/work/building, Original, WA)
+  - `ABS_BUILDAPP_START` (default `2015-01`)
+- You can still supply full SDMX URLs or CSV fallbacks if necessary:
+  - `ABS_UNEMPLOYMENT_SDMX_URL`, `ABS_BUILDAPP_SDMX_URL`
+  - `UNEMPLOYMENT_CSV_URL`, `BUILDING_APPROVALS_CSV_URL`
+  - `RBA_CASHRATE_CSV_URL` (optional override for the cash rate)
+
+If none of the above are set, the loader falls back to local CSVs under `data_raw/external/`:
+- `data_raw/external/unemployment_rate_wa.csv` with columns `month,wa_unemp_rate_sa`
+- `data_raw/external/building_approvals_wa.csv` with columns `month,wa_build_approvals_num`
+
+Example usage (bash):
+```bash
+# override ABS defaults only if you need a different series
+export ABS_UNEMPLOYMENT_KEY="M13.3.1599.30.5.M"  # trend instead of seasonally adjusted
+python -m src.data_ingest.external_signals
+python -m tools.time_split_validate \
+  --train-start 2025-01 --train-end 2025-04 \
+  --val-start 2025-06 --val-end 2025-09 \
+  --with-external
+```
+
+Notes:
+- ABS Data API calls are made via `curl` (user-agent friendly); responses are parsed in Python.
+- Any missing series are skipped gracefully; the pipeline proceeds with whichever columns are available.
+
+### Optional data quality and bias toggles
+
+- Ingest winsorization (reduce outlier influence in raw lodgements):
+  - Set `WINSORIZE_RENT=1` before running `src.data_ingest.process_bonds` (or `src.cli.commands.one_click`).
+  - Quantiles configurable via `WINSOR_LO`/`WINSOR_HI` (defaults `0.01/0.99`).
+
+- Forecast per‑SA2 bias correction (light calibration on last K realized months):
+  - Add `--bias-correct-l6` to `python -m src.models.forecast` (uses K=6 by default).
+  - Or set `BIAS_CORRECT_L6=1` and optionally `BIAS_CORR_MONTHS=K`.
+  - `BIAS_CORR_GAMMA` scales the correction strength (default `0.25` for mild correction).
+  - This subtracts `gamma × mean_residual` over the last K months from the new prediction and clips to [0,1]. The raw (uncorrected) probability is kept in `price_pressure_prob_raw`.
+
+Quick experiments (spatial + external + calendar + recency):
+```bash
+# Build signals and adjacency once
+python -m src.data_ingest.external_signals
+python -m tools.spatial_features
+
+# Fixed split
+python -m tools.time_split_validate \
+  --train-start 2025-01 --train-end 2025-04 \
+  --val-start 2025-06 --val-end 2025-09 \
+  --with-external --extra-features --with-spatial \
+  --recency-half-life 12 --draws 400 --tune 400 --chains 1 --cores 1
+
+python -m src.reporting.evaluate_forecasts --start 2025-06 --end 2025-09
+
+# Walk-forward (refits per target month)
+python -m tools.time_split_validate \
+  --train-start 2025-01 --train-end 2025-04 \
+  --val-start 2025-06 --val-end 2025-09 \
+  --walk-forward --with-external --extra-features --with-spatial \
+  --recency-half-life 12 --draws 400 --tune 400 --chains 1 --cores 1
+
+python -m src.reporting.evaluate_forecasts --start 2025-06 --end 2025-09
+```
+
+### Optional GBM baseline (advanced)
+
+If you want a quick non‑Bayesian baseline for comparison/stacking:
+
+```bash
+pip install lightgbm scikit-learn
+python -m src.models.nowcast --draws 400 --tune 400 --chains 1 --cores 1
+python -m tools.gbm_baseline
+```
+
+This writes `outputs/gbm_baseline_latest.parquet` with `p_gbm` for the next month, using the same core features (availability_rate, churn, rent momentum). You can use it to sanity‑check or as one input to a simple stacker.
+
+## New defaults and stronger validation
+
+One-click (`python -m src.cli one-click`) now pins sensible defaults that gave small but consistent gains in calibration and weighted error on recent months:
+
+- Data quality: winsorize lodgement rents at 5–95% (override via `WINSOR_LO/H I`).
+- Features: external signals, spatial neighbor mean availability, calendar dummies.
+- Recency: half‑life weighting (12 months) in fitting.
+- Validation: walk‑forward across the validation window with stacking and calibration.
+  - Stacking blends the Bayesian logistic with a boosted‑tree model (LightGBM if available), and isotonic calibration aligns probabilities to observed frequencies.
+- Forecast: same enriched features as validation, with mild bias correction (`BIAS_CORR_GAMMA=0.25`, window `BIAS_CORR_MONTHS=6`). Raw probabilities are preserved as `price_pressure_prob_raw`.
+
+### Extended default split
+
+If at least 18 months of data exist, the one‑click default split is:
+- Train: last 12 months
+- Validate: last 6 months (walk‑forward refits)
+
+Otherwise it falls back to a 4‑month train and 4‑month validation in the latest year.
+
+### New validation flags (tools/time_split_validate.py)
+
+- `--use-gbm`: use a boosted‑tree classifier for the forecast stage (LightGBM or sklearn fallback).
+- `--stack-gbm`: blend Bayesian logistic and GBM predictions (simple average).
+- `--calibrate-isotonic`: apply isotonic calibration on the train window.
+
+Example (longer window, stacked + calibrated):
+
+```bash
+python -m tools.time_split_validate \
+  --train-start 2024-07 --train-end 2025-06 \
+  --val-start 2025-07 --val-end 2025-12 \
+  --with-external --extra-features --with-spatial \
+  --recency-half-life 12 --stack-gbm --calibrate-isotonic --walk-forward
+python -m src.reporting.evaluate_forecasts --start 2025-07 --end 2025-12
+```
+
+### Live forecast parity (src/models/forecast.py)
+
+The live forecast now uses the same enriched features as validation when available:
+- Calendar dummies, simple lags (`availability_rate_lag1`, `churn_rate_lag1`, `rent_mom_12m`).
+- Neighbor mean availability (`sa2_neighbors.parquet`).
+- External signals and their lags (`rba_cash_rate`, `wa_unemp_rate_sa`, `wa_build_approvals_num`, plus `_lag1/_lag3`).
+- Mild bias correction controlled via `BIAS_CORR_GAMMA` (default `0.25`) and `BIAS_CORR_MONTHS` (default `6`).
+
+### Dependencies
+
+Two optional ML deps were added for stacking/calibration:
+
+- `lightgbm>=4.4` (preferred) and `scikit-learn>=1.5` (fallback + isotonic).
+
+They are included in `requirements.txt`. If LightGBM is unavailable, the code falls back to sklearn’s GradientBoostingClassifier.
