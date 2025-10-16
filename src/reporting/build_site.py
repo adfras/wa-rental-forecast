@@ -261,6 +261,9 @@ def _best_f1_threshold(p: np.ndarray, y: np.ndarray) -> tuple[float, float, floa
 def build_threshold_dataset(spec: dict, sa2_panel: pd.DataFrame, docs_prev: pd.DataFrame | None) -> dict | None:
     history_paths = _gather_history_paths(spec)
     preds_frames: list[pd.DataFrame] = []
+    if docs_prev is not None and not docs_prev.empty:
+        preds_frames.append(docs_prev.copy())
+
     for path in history_paths:
         try:
             df_p = pd.read_parquet(path).copy()
@@ -270,9 +273,6 @@ def build_threshold_dataset(spec: dict, sa2_panel: pd.DataFrame, docs_prev: pd.D
         if df_p.empty:
             continue
         preds_frames.append(df_p)
-
-    if docs_prev is not None and not docs_prev.empty:
-        preds_frames.append(docs_prev.copy())
 
     if not preds_frames:
         print(f"[warn] No forecast history for {spec['id']} — skipping threshold")
@@ -322,7 +322,7 @@ def build_threshold_dataset(spec: dict, sa2_panel: pd.DataFrame, docs_prev: pd.D
             best_thr[m_str] = thr_m
 
         if thr_m is None or not np.isfinite(thr_m):
-            thr_m = 0.5
+            thr_m = 0.33
 
         payload: dict[str, dict] = {}
         for _, r in dfm.iterrows():
