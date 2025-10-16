@@ -1,7 +1,19 @@
 # WA Rental Forecast
 
-**Bayesian nowcast + forecast of rental price pressure at SA2 level (Western Australia).**  
-Outputs a Top‑20 list, an interactive map, and a spreadsheet of probabilities that **next month’s median rent rises by more than 2%** (default threshold), with automatic monthly back‑testing once new data lands.
+WA Rental Forecast is an end-to-end analytics pipeline that tracks rental pressure across Western Australia and predicts where the next rent spike will happen at SA2 (suburb-group) level. Each month it ingests Department of Mines, Industry Regulation and Safety (AHDAP) bond lodgement data, nowcasts current rental availability, and forecasts the probability that the **next month’s median rent will rise faster than a chosen threshold (2 % by default)**. The outputs power policy briefings, investor dashboards, and an interactive public map.
+
+### What you get each release
+- **Probability surfaces** for all WA SA2s (JSON + Excel) so you can slice by region or share with partners.
+- **Top‑20 pressure list** spotlighting the suburbs most at risk of sharp rent lifts.
+- **Interactive Leaflet map** with historical playback, actual outcomes, and per-suburb metrics.
+- **Evaluation pack** (AUC, Brier, precision/recall, calibration plots) once actual rents are observed, so you can judge model skill transparently.
+
+### How it works
+1. **Data ingest** – downloads AHDAP rental bond ZIPs, aligns them to ABS SA2 boundaries, and stages them as monthly panels.
+2. **Nowcast** – fits a Bayesian negative-binomial model to estimate the current availability rate per SA2.
+3. **Forecast** – trains a hierarchical logistic regression (with booster and calibration options) to convert availability, churn, price momentum, macro and sparse-market signals into rent-rise probabilities.
+4. **Validation** – scores every month with walk-forward tests, recommends an operating threshold that maximises F1, and reruns once actual outcomes land.
+5. **Reporting & site build** – publishes CSVs, spreadsheets, charts, and the docs/ static site ready for Netlify deployment.
 
 **Live site:** https://wa-rental-forecast.netlify.app
 
