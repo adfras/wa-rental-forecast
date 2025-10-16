@@ -597,6 +597,7 @@ Cron tips:
 
 **Folium map feels slow**  
 - Geometries are simplified in meters; raise tolerance for more speed/smaller HTML.
+- Map metrics stuck at a 0.500 cutoff? Re-run `make site`; the builder now recomputes per-month best-F1 thresholds from the joined predictions and actuals whenever the evaluation summary for that month is missing, so metrics refresh as soon as new actuals land.
 
 **PyMC `MutableData` missing / BLAS warning**  
 - Not used: the models work with NumPy arrays (PyMC 5).  
