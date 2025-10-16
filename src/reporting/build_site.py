@@ -207,6 +207,57 @@ def _log_loss(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> float:
     return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
 
 
+def _best_f1_threshold(p: np.ndarray, y: np.ndarray) -> tuple[float, float, float, float]:
+    """Return the (threshold, precision, recall, accuracy) that maximises F1."""
+    p = np.asarray(p, dtype=float)
+    y = np.asarray(y, dtype=int)
+
+    mask = np.isfinite(p)
+    p = p[mask]
+    y = y[mask]
+
+    # Need at least one observation with an actual label to compute anything sensible
+    if p.size == 0 or y.size == 0 or (y.sum() == 0 and (1 - y).sum() == 0):
+        return 0.5, float("nan"), float("nan"), float("nan")
+
+    candidates = np.unique(p)
+    if candidates.size < 5:
+        candidates = np.unique(np.concatenate([candidates, np.linspace(0.1, 0.9, 17)]))
+
+    best_threshold = 0.5
+    best_f1 = -1.0
+    best_precision = float("nan")
+    best_recall = float("nan")
+    best_accuracy = float("nan")
+
+    for thr in candidates:
+        if not np.isfinite(thr):
+            continue
+        yhat = (p >= thr).astype(int)
+        tp = int(((yhat == 1) & (y == 1)).sum())
+        fp = int(((yhat == 1) & (y == 0)).sum())
+        fn = int(((yhat == 0) & (y == 1)).sum())
+        tn = int(((yhat == 0) & (y == 0)).sum())
+
+        precision = (tp / (tp + fp)) if (tp + fp) else float("nan")
+        recall = (tp / (tp + fn)) if (tp + fn) else float("nan")
+
+        if np.isnan(precision) or np.isnan(recall) or (precision + recall == 0):
+            f1 = 0.0
+        else:
+            f1 = 2 * precision * recall / (precision + recall)
+
+        # Prefer the lowest threshold on ties so recall does not collapse
+        if (f1 > best_f1) or (np.isclose(f1, best_f1) and thr < best_threshold):
+            best_f1 = f1
+            best_threshold = float(thr)
+            best_precision = precision
+            best_recall = recall
+            best_accuracy = ((tp + tn) / len(y)) if len(y) else float("nan")
+
+    return best_threshold, best_precision, best_recall, best_accuracy
+
+
 def build_threshold_dataset(spec: dict, sa2_panel: pd.DataFrame, docs_prev: pd.DataFrame | None) -> dict | None:
     history_paths = _gather_history_paths(spec)
     preds_frames: list[pd.DataFrame] = []
@@ -255,7 +306,23 @@ def build_threshold_dataset(spec: dict, sa2_panel: pd.DataFrame, docs_prev: pd.D
     for m in months:
         dfm = joined[joined["month"] == m]
         m_str = pd.Timestamp(m).strftime("%Y-%m")
-        thr_m = float(best_thr.get(m_str, 0.5))
+        actual_mask = dfm["actual"].notna()
+
+        thr_raw = best_thr.get(m_str)
+        thr_m: float | None
+        try:
+            thr_m = float(thr_raw) if thr_raw is not None else None
+        except (TypeError, ValueError):
+            thr_m = None
+
+        if (thr_m is None or not np.isfinite(thr_m)) and actual_mask.any():
+            p_vals = dfm.loc[actual_mask, "price_pressure_prob"].to_numpy()
+            y_vals = dfm.loc[actual_mask, "actual"].astype(int).to_numpy()
+            thr_m, _, _, _ = _best_f1_threshold(p_vals, y_vals)
+            best_thr[m_str] = thr_m
+
+        if thr_m is None or not np.isfinite(thr_m):
+            thr_m = 0.5
 
         payload: dict[str, dict] = {}
         for _, r in dfm.iterrows():
@@ -298,7 +365,6 @@ def build_threshold_dataset(spec: dict, sa2_panel: pd.DataFrame, docs_prev: pd.D
         payload_cache[m_str] = payload
         _write_json(threshold_dir / f"{m_str}.json", payload)
 
-        actual_mask = dfm["actual"].notna()
         if actual_mask.any():
             p = dfm.loc[actual_mask, "price_pressure_prob"].to_numpy()
             y = dfm.loc[actual_mask, "actual"].astype(int).to_numpy()
