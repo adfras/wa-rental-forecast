@@ -8,15 +8,17 @@ Builds features from the SA2 panel and fits an NB model with:
 
 Writes `data_stage/availability_nowcast_sa2.parquet` with availability_rate.
 """
+import argparse
+
+import arviz as az
 import numpy as np
 import pandas as pd
 import pymc as pm
-import arviz as az
-import argparse
 
 from src.config import STAGE_DIR, RANDOM_SEED
 from src.features.dates import compute_recency_weights
 from src.models.nowcast_design import prepare_design
+from src.common.pymc_helpers import sample_nuts
 
 def build_design():
     """Load SA2 panel and return standardized nowcast design arrays."""
@@ -77,13 +79,13 @@ def fit_nowcast(
             y_dist = pm.NegativeBinomial.dist(mu=mu, alpha=alpha_nb)
             pm.Potential("weighted_loglik_nb", (w * pm.logp(y_dist, y)).sum())
 
-        idata = pm.sample(
+        idata = sample_nuts(
             draws=draws,
             tune=tune,
             chains=chains,
             cores=cores,
             target_accept=target_accept,
-            step=pm.NUTS(max_treedepth=max_treedepth),
+            max_treedepth=max_treedepth,
             random_seed=RANDOM_SEED,
             progressbar=True,
         )

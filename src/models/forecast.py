@@ -6,18 +6,19 @@ model includes SA2 random intercepts. Writes:
  - data_stage/price_pressure_forecast_sa2.parquet
  - appends to data_stage/price_pressure_forecast_sa2_history.parquet
 """
+import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
+
+import arviz as az
 import numpy as np
 import pandas as pd
 import pymc as pm
-import arviz as az
-import argparse
-import os
-
 from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.ensemble import GradientBoostingClassifier
 
 from src.config import (
     EVAL_DIR,
@@ -26,19 +27,29 @@ from src.config import (
     RANDOM_SEED,
     FORECAST_RECENCY_HALFLIFE,
 )
+from src.common.pymc_helpers import sample_nuts
 from src.features.dates import compute_recency_weights, to_month
 from src.features.engineering import (
     add_calendar_features,
     add_churn_proxy,
     add_rent_momentum,
+    add_supply_shock_features,
+    add_sparse_market_features,
+    add_time_since_spike,
     apply_standardization,
     add_group_demean,
     add_interaction_features,
+    compute_lodgement_weights,
     standardize_columns,
 )
 
 def _expit(x):
     return 1.0 / (1.0 + np.exp(-x))
+
+
+def _safe_logit(p: np.ndarray) -> np.ndarray:
+    clipped = np.clip(p, 1e-6, 1 - 1e-6)
+    return np.log(clipped / (1.0 - clipped))
 
 
 def _winsorize_series(s: pd.Series,
@@ -199,7 +210,12 @@ def build_dataset(*, threshold: float = RENT_GROWTH_THRESHOLD):
 
     # Label: next-month rent rise > threshold
     df["median_rent_next"] = df.groupby("sa2_code")["median_rent"].shift(-1)
-    df["y"] = ((df["median_rent_next"] - df["median_rent"]) / df["median_rent"] > threshold).astype(float)
+    valid_label = df["median_rent_next"].notna() & df["median_rent"].notna()
+    df["y"] = np.where(
+        valid_label,
+        ((df["median_rent_next"] - df["median_rent"]) / df["median_rent"] > threshold).astype(float),
+        np.nan,
+    )
 
     # Clip extreme feature values to stabilize sampling (robust to outliers)
     # Churn is a rate; cap to [0, 1]
@@ -218,6 +234,35 @@ def build_dataset(*, threshold: float = RENT_GROWTH_THRESHOLD):
     df["churn_rate_lag1"] = df.groupby("sa2_code")["churn_rate"].shift(1)
     df["rent_mom_12m"] = (df["median_rent"] / df.groupby("sa2_code")["median_rent"].shift(12)) - 1.0
     df["rent_mom_12m"] = _winsorize_series(df["rent_mom_12m"], lower_bound=-1.5, upper_bound=1.5)
+
+    # Rent shock features for low-supply regions
+    df = add_time_since_spike(df, threshold=max(float(threshold), 0.02))
+    if "time_since_spike" in df.columns:
+        df["time_since_spike"] = df["time_since_spike"].clip(lower=0.0, upper=60.0)
+    df = add_supply_shock_features(
+        df,
+        rent_spike_threshold=max(float(threshold), 0.02),
+        availability_col="availability_rate",
+        stock_col="stock_bonds",
+    )
+    if "rent_spike_magnitude" in df.columns:
+        df["rent_spike_magnitude"] = _winsorize_series(df["rent_spike_magnitude"], lower_bound=0.0, upper_bound=1.0)
+    df = add_sparse_market_features(
+        df,
+        rent_col="median_rent",
+        lodgement_col="count_lodgements",
+        stock_col="stock_bonds",
+    )
+
+    # Lodgement-based weights to down-weight noisy months (low coverage)
+    lodge_k = float(os.getenv("LODGE_SMOOTHING", "12"))
+    lodge_floor = float(os.getenv("LODGE_WEIGHT_FLOOR", "0.05"))
+    df["lodgement_weight"] = compute_lodgement_weights(
+        df,
+        lodgements_col="count_lodgements",
+        smoothing=lodge_k,
+        floor=lodge_floor,
+    )
 
     # Month-level demeaned variants for WA context
     demean_cols = ["availability_rate", "churn_rate", "rent_mom_1m", "rent_mom_3m"]
@@ -259,6 +304,34 @@ def build_dataset(*, threshold: float = RENT_GROWTH_THRESHOLD):
         name = f"{a}__x__{b}"
         if name in df.columns:
             feat_cols.append(name)
+    for c in [
+        "time_since_spike",
+        "rent_spike_flag",
+        "rent_spike_magnitude",
+        "low_availability_flag",
+        "rent_spike_low_availability",
+        "stock_pressure_6m",
+        "stock_crunch_flag",
+        "rent_spike_stock_crunch",
+        "lodgement_rel_3m",
+        "lodgement_rel_12m",
+        "lodgement_wa_ratio",
+        "lodgement_wa_zscore",
+        "low_lodgement_flag",
+        "lodgement_dropout_flag",
+        "rent_spike_recent_3m",
+        "rent_spike_recent_6m",
+        "rent_spike_ewma",
+        "low_stock_flag_sparse",
+        "thin_market_flag",
+        "thin_market_spike_recent",
+        "thin_market_spike_ewma",
+        "thin_market_dropout",
+    ]:
+        if c in df.columns:
+            feat_cols.append(c)
+    if "lodgement_weight" in df.columns:
+        feat_cols.append("lodgement_weight")
     # Optional ext + neighbor columns
     for c in ["nbr_availability_rate", "rba_cash_rate", "wa_unemp_rate", "wa_unemp_rate_sa",
               "wa_building_approvals", "wa_build_approvals_num",
@@ -275,6 +348,26 @@ def build_dataset(*, threshold: float = RENT_GROWTH_THRESHOLD):
         for c in all_na_cols:
             df.drop(columns=[c], inplace=True, errors="ignore")
         feat_cols = [c for c in feat_cols if c not in all_na_cols]
+
+    # Shrink volatility-driven features toward zero when coverage is thin
+    if "lodgement_weight" in df.columns:
+        shrink_targets = [
+            "rent_mom_1m",
+            "rent_mom_3m",
+            "rent_mom_12m",
+            "rent_spike_flag",
+            "rent_spike_magnitude",
+            "rent_spike_low_availability",
+            "rent_spike_stock_crunch",
+            "rent_spike_recent_3m",
+            "rent_spike_recent_6m",
+            "rent_spike_ewma",
+            "thin_market_spike_recent",
+            "thin_market_spike_ewma",
+        ]
+        for col in shrink_targets:
+            if col in df.columns:
+                df[col] = df[col] * df["lodgement_weight"]
 
     # Do not drop rows for feature NaNs — standardize_columns will impute
     # with feature-wise means. Only require the label to be present.
@@ -301,7 +394,59 @@ def build_dataset(*, threshold: float = RENT_GROWTH_THRESHOLD):
         pseudo_df = pd.DataFrame(pseudo_rows)
         df_model = pd.concat([df_model, pseudo_df], ignore_index=True)
     pseudo_mask = df_model["_is_pseudo"].astype(bool).to_numpy()
+
+    # Gradient-boosting booster to assist thin markets (optional)
+    booster_enabled = os.getenv("SPARSE_MARKET_BOOSTER", "1").lower() in {"1", "true", "yes"}
+    booster_features = [c for c in feat_cols if c in df_model.columns]
+    booster_model = None
+    booster_means: dict[str, float] | None = None
+    if booster_enabled and booster_features and len(df_model) >= 30:
+        try:
+            X_train = df_model[booster_features].copy()
+            booster_means = {c: float(X_train[c].mean(skipna=True) or 0.0) for c in booster_features}
+            for c, mean_val in booster_means.items():
+                X_train[c] = X_train[c].fillna(mean_val)
+            y_train = df_model["y"].astype(int).to_numpy()
+            weight = np.ones(len(df_model), dtype=float)
+            if "lodgement_weight" in df_model.columns:
+                weight *= df_model["lodgement_weight"].fillna(1.0).to_numpy()
+            if pseudo_mask.any():
+                pseudo_scale = float(os.getenv("SPARSE_BOOSTER_PSEUDO_WEIGHT", "0.2"))
+                weight[pseudo_mask] = pseudo_scale
+
+            booster_model = GradientBoostingClassifier(
+                n_estimators=int(os.getenv("SPARSE_BOOST_N_EST", "300")),
+                learning_rate=float(os.getenv("SPARSE_BOOST_LR", "0.05")),
+                subsample=float(os.getenv("SPARSE_BOOST_SUBSAMPLE", "0.7")),
+                max_depth=int(os.getenv("SPARSE_BOOST_MAX_DEPTH", "3")),
+                min_samples_leaf=int(os.getenv("SPARSE_BOOST_MIN_LEAF", "15")),
+                random_state=RANDOM_SEED,
+            )
+            booster_model.fit(X_train.values, y_train, sample_weight=weight)
+
+            prob_train = booster_model.predict_proba(X_train.values)[:, 1]
+            df_model["booster_logit"] = _safe_logit(prob_train)
+
+            X_full = df[booster_features].copy()
+            for c, mean_val in booster_means.items():
+                if c in X_full.columns:
+                    X_full[c] = X_full[c].fillna(mean_val)
+            prob_full = booster_model.predict_proba(X_full.values)[:, 1]
+            df["booster_logit"] = _safe_logit(prob_full)
+            if "booster_logit" not in feat_cols:
+                feat_cols.append("booster_logit")
+        except Exception as exc:
+            print(f"[warn] sparse booster disabled: {exc}")
+            booster_model = None
+
     df_model = df_model.drop(columns=["_is_pseudo"])
+
+    # Observation weights based on lodgement coverage (post pseudo-injection)
+    lodgement_weight = None
+    if "lodgement_weight" in df_model.columns:
+        lodgement_weight = df_model["lodgement_weight"].astype(float).to_numpy()
+        min_w = float(os.getenv("LODGE_WEIGHT_FLOOR", "0.05"))
+        lodgement_weight = np.clip(lodgement_weight, min_w, 1.0)
 
     # Standardize features
     Xz, mu, sd = standardize_columns(df_model, feat_cols)
@@ -315,7 +460,22 @@ def build_dataset(*, threshold: float = RENT_GROWTH_THRESHOLD):
     month_idx = pd.Categorical(df_model["month"], categories=month_codes).codes.astype(int)
 
     y = df_model["y"].astype(int).to_numpy()
-    return df_model, Xz, y, sa2_idx, sa2_codes, feat_cols, mu, sd, df, month_idx, month_codes, pseudo_mask, float(pseudo_weight)
+    return (
+        df_model,
+        Xz,
+        y,
+        sa2_idx,
+        sa2_codes,
+        feat_cols,
+        mu,
+        sd,
+        df,
+        month_idx,
+        month_codes,
+        pseudo_mask,
+        float(pseudo_weight),
+        lodgement_weight,
+    )
 
 def fit_forecast(
         draws: int = 1000,
@@ -324,7 +484,8 @@ def fit_forecast(
         cores: int = 4,
         recency_half_life: float | None = FORECAST_RECENCY_HALFLIFE,
         bias_correct_l6: bool = False,
-        calibrate_isotonic: bool = False,
+    calibrate_isotonic: bool = False,
+    calibrate_use_raw: bool = False,
         prior_shift: bool = False,
         auto_calibrate: bool = True,
         target_accept: float = 0.99,
@@ -342,8 +503,22 @@ def fit_forecast(
         retry_draw_multiplier: float = 1.5,
     ):
     """Fit the hierarchical logistic forecast and write predictions + history."""
-    (df_model, Xz, y, sa2_idx, sa2_codes, feat_cols,
-     mu, sd, df_full, month_idx_train, month_codes, pseudo_mask, pseudo_weight) = build_dataset(threshold=threshold)
+    (
+        df_model,
+        Xz,
+        y,
+        sa2_idx,
+        sa2_codes,
+        feat_cols,
+        mu,
+        sd,
+        df_full,
+        month_idx_train,
+        month_codes,
+        pseudo_mask,
+        pseudo_weight,
+        lodgement_weight,
+    ) = build_dataset(threshold=threshold)
     n_sa2 = len(sa2_codes)
     n_month = len(month_codes)
     n, k = Xz.shape
@@ -382,6 +557,11 @@ def fit_forecast(
     # Optional recency weights (half-life in months)
     pseudo_mask = np.asarray(pseudo_mask, dtype=bool)
     w = compute_recency_weights(df_model["month"], recency_half_life)
+    if lodgement_weight is not None:
+        if w is None:
+            w = lodgement_weight
+        else:
+            w = np.asarray(w, dtype=float) * lodgement_weight
     if pseudo_mask.any():
         base_w = np.ones(len(df_model), dtype=float) if w is None else np.asarray(w, dtype=float)
         pseudo_w = max(1e-3, float(pseudo_weight))
@@ -467,12 +647,13 @@ def fit_forecast(
 
         def _run_pymc(draws_now: int, tune_now: int, init_arg: str) -> az.InferenceData:
             t0_local = time.time()
-            idata_local = pm.sample(
+            idata_local = sample_nuts(
                 draws=draws_now,
                 tune=tune_now,
                 chains=chains,
                 cores=cores,
-                step=pm.NUTS(target_accept=target_accept, max_treedepth=max_treedepth),
+                target_accept=target_accept,
+                max_treedepth=max_treedepth,
                 init=init_arg,
                 random_seed=RANDOM_SEED,
                 progressbar=True,
@@ -728,6 +909,8 @@ def fit_forecast(
             pass
     # Optional isotonic calibration using last K realized months
     env_calibrate = str(os.getenv("CALIBRATE_ISOTONIC", "0")).lower() in {"1","true","yes"}
+    env_calib_use_raw = str(os.getenv("CALIB_USE_RAW", "0")).lower() in {"1","true","yes"}
+    calib_input_use_raw = calibrate_use_raw or env_calib_use_raw
     should_calibrate = calibrate_isotonic or env_calibrate
     if auto_calibrate and not should_calibrate:
         if df_model["month"].nunique() >= 6 and df_model["y"].sum() >= 20:
@@ -753,13 +936,34 @@ def fit_forecast(
                 jm = j.groupby("month").size().reset_index(name="n")
                 last_months = jm["month"].sort_values().tail(max(Kc,1)).tolist()
                 cal = j[j["month"].isin(last_months)].copy()
-                p_tr = cal["price_pressure_prob"].astype(float).to_numpy()
+                prob_col = "price_pressure_prob_raw" if (calib_input_use_raw and "price_pressure_prob_raw" in cal.columns) else "price_pressure_prob"
+                p_tr = cal[prob_col].astype(float).to_numpy()
                 y_tr = cal["actual_jump"].astype(int).to_numpy()
-                if p_tr.size >= 10 and len(set(y_tr)) == 2:
-                    iso = IsotonicRegression(out_of_bounds="clip")
-                    iso.fit(p_tr, y_tr)
+                if "price_pressure_prob_raw" not in out.columns:
                     out["price_pressure_prob_raw"] = out["price_pressure_prob"]
-                    out["price_pressure_prob"] = iso.transform(out["price_pressure_prob"].to_numpy())
+                base_probs = out["price_pressure_prob_raw"] if (calib_input_use_raw and "price_pressure_prob_raw" in out.columns) else out["price_pressure_prob"]
+                applied_clusters = 0
+                cluster_col = "price_cluster" if "price_cluster" in cal.columns else None
+                if cluster_col and cal[cluster_col].notna().any() and cluster_col in out.columns:
+                    for cluster_val, grp in cal.groupby(cluster_col):
+                        grp = grp.dropna(subset=[prob_col])
+                        p_tr_grp = grp[prob_col].astype(float).to_numpy()
+                        y_tr_grp = grp["actual_jump"].astype(int).to_numpy()
+                        if p_tr_grp.size < 10 or len(set(y_tr_grp)) < 2:
+                            continue
+                        iso = IsotonicRegression(out_of_bounds="clip")
+                        iso.fit(p_tr_grp, y_tr_grp)
+                        mask_out = out[cluster_col] == cluster_val
+                        if mask_out.any():
+                            out.loc[mask_out, "price_pressure_prob"] = iso.transform(base_probs.loc[mask_out].to_numpy())
+                            applied_clusters += 1
+                if applied_clusters == 0:
+                    if p_tr.size >= 10 and len(set(y_tr)) == 2:
+                        iso = IsotonicRegression(out_of_bounds="clip")
+                        iso.fit(p_tr, y_tr)
+                        out["price_pressure_prob"] = iso.transform(base_probs.to_numpy())
+                        calibration_applied = True
+                else:
                     calibration_applied = True
         except Exception:
             pass
@@ -930,6 +1134,8 @@ if __name__ == "__main__":
                     help="Apply per-SA2 bias correction using last 6 realized months (env BIAS_CORR_MONTHS to change window)")
     ap.add_argument("--calibrate-isotonic", action="store_true",
                     help="Apply isotonic calibration using last K realized months (env CALIB_MONTHS)")
+    ap.add_argument("--calib-use-raw", action="store_true",
+                    help="Train isotonic calibrator on raw model probabilities instead of previously calibrated values.")
     ap.add_argument("--prior-shift", action="store_true",
                     help="Adjust logits toward recent realized prevalence (env PRIOR_MONTHS; default 3)")
     ap.add_argument("--target-accept", type=float, default=0.92,
@@ -970,6 +1176,7 @@ if __name__ == "__main__":
         recency_half_life=None if args.no_recency_weights else args.recency_half_life,
         bias_correct_l6=args.bias_correct_l6,
         calibrate_isotonic=args.calibrate_isotonic,
+        calibrate_use_raw=args.calib_use_raw,
         prior_shift=args.prior_shift,
         auto_calibrate=args.auto_calibrate,
         target_accept=args.target_accept,

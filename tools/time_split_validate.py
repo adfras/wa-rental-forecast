@@ -30,6 +30,11 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 
+try:  # tqdm is optional; fall back to plain iteration if unavailable.
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - import failure only hits in unusual envs
+    tqdm = None  # type: ignore
+
 from src.config import (
     STAGE_DIR,
     RENT_GROWTH_THRESHOLD,
@@ -83,6 +88,17 @@ def _load_external_signals():
         return df[["month", *ext_cols]], ext_cols
     except Exception:
         return None, []
+
+
+def _progress(iterable, *, desc: str):
+    """Return iterable wrapped in a tqdm progress bar when available."""
+    if tqdm is None:
+        return iterable
+    try:
+        total = len(iterable)  # type: ignore[arg-type]
+    except TypeError:
+        total = None
+    return tqdm(iterable, total=total, desc=desc)
 
 
 # ----------------- availability helpers -----------------
@@ -551,8 +567,6 @@ def predict_forecast(post: ForecastPosterior,
                 lin = lin + post.month_effect[:, midx]
         cidx = post.cluster_index.get(str(row["sa2_code"]), 0)
         lin = lin + post.cluster_effect[:, cidx]
-        cidx = post.cluster_index.get(str(row["sa2_code"]), 0)
-        lin = lin + post.cluster_effect[:, cidx]
         # numerically stable expit to avoid overflow warnings on extreme logits
         lin_c = np.clip(lin, -500, 500)
         ps = 1.0 / (1.0 + np.exp(-lin_c))
@@ -699,7 +713,12 @@ def _build_feature_frame(sa2: pd.DataFrame,
                    on=["sa2_code", "month"], how="left").copy()
     df = df.sort_values(["sa2_code", "month"]).copy()
     df["median_rent_next"] = df.groupby("sa2_code")["median_rent"].shift(-1)
-    df["y"] = ((df["median_rent_next"] - df["median_rent"]) / df["median_rent"] > threshold).astype(float)
+    valid_label = df["median_rent_next"].notna() & df["median_rent"].notna()
+    df["y"] = np.where(
+        valid_label,
+        ((df["median_rent_next"] - df["median_rent"]) / df["median_rent"] > threshold).astype(float),
+        np.nan,
+    )
     df = add_churn_proxy(df)
     return df
 
@@ -1115,7 +1134,7 @@ def main(train_start: pd.Timestamp,
         train_n = len(train_df)
         train_pos = int(train_df["y"].sum()) if "y" in train_df.columns else 0
         train_rate = train_pos / train_n if train_n else float("nan")
-        for T in sorted(val_months):
+        for T in _progress(sorted(val_months), desc="Validation months"):
             base_m = prev_month(T)
             base_df = df[df["month"] == base_m].copy()
             if base_df.empty:
@@ -1212,7 +1231,7 @@ def main(train_start: pd.Timestamp,
         preds = []
         # We reuse processed SA2 with momentum
         cached_notice_emitted = False
-        for T in sorted(val_months):
+        for T in _progress(sorted(val_months), desc="Walk-forward months"):
             base_m = prev_month(T)
             # Define windows:
             # - Nowcast trained on months in [train_start .. base_m]

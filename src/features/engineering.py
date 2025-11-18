@@ -85,6 +85,202 @@ def add_time_since_spike(
     return out
 
 
+def add_supply_shock_features(
+    df: pd.DataFrame,
+    *,
+    group_col: str = "sa2_code",
+    month_col: str = "month",
+    rent_col: str = "median_rent",
+    availability_col: str = "availability_rate",
+    stock_col: str = "stock_bonds",
+    rent_spike_threshold: float = 0.025,
+    low_availability_quantile: float = 0.2,
+    stock_decline_threshold: float = -0.08,
+) -> pd.DataFrame:
+    """Return a frame with rent-shock and low-stock supply pressure features.
+
+    Columns created (filled with 0.0 when the inputs are unavailable):
+      - ``rent_spike_flag``: indicator that the 1-month rent change exceeds
+        ``rent_spike_threshold``.
+      - ``rent_spike_magnitude``: positive portion of the 1-month rent change.
+      - ``low_availability_flag``: availability is beneath the monthly
+        ``low_availability_quantile`` (default 20th percentile).
+      - ``rent_spike_low_availability``: interaction of spike + low supply.
+      - ``stock_pressure_6m``: percent deviation from the 6-month rolling
+        median stock, clipped to [-1, 1].
+      - ``stock_crunch_flag``: indicator that ``stock_pressure_6m`` is below
+        ``stock_decline_threshold``.
+      - ``rent_spike_stock_crunch``: interaction of spike + stock crunch.
+    """
+
+    out = df.sort_values([group_col, month_col]).copy()
+
+    # 1-month rent change and spike indicators
+    rent_change = out.groupby(group_col)[rent_col].pct_change(fill_method=None) if rent_col in out.columns else None
+    if rent_change is None:
+        out["rent_spike_flag"] = 0.0
+        out["rent_spike_magnitude"] = 0.0
+    else:
+        out["rent_spike_flag"] = (rent_change > float(rent_spike_threshold)).astype(float).fillna(0.0)
+        out["rent_spike_magnitude"] = rent_change.clip(lower=0.0).fillna(0.0)
+
+    # Availability-based low supply flag
+    if availability_col in out.columns:
+        avail = out[availability_col].astype(float)
+        def _quantile(series: pd.Series) -> float:
+            return float(series.quantile(low_availability_quantile)) if series.notna().any() else np.nan
+
+        month_low = out.groupby(month_col)[availability_col].transform(_quantile)
+        out["low_availability_flag"] = (avail <= month_low).astype(float).fillna(0.0)
+    else:
+        out["low_availability_flag"] = 0.0
+
+    out["rent_spike_low_availability"] = out["rent_spike_flag"] * out["low_availability_flag"]
+
+    # Stock-based supply pressure metrics
+    if stock_col in out.columns:
+        stock = out[stock_col].astype(float)
+        rolling_med = (
+            stock.groupby(out[group_col])
+            .transform(lambda s: s.rolling(window=6, min_periods=3).median())
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pressure = stock / rolling_med - 1.0
+        pressure = pressure.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        pressure = pressure.clip(lower=-1.0, upper=1.0)
+        out["stock_pressure_6m"] = pressure
+        out["stock_crunch_flag"] = (pressure <= float(stock_decline_threshold)).astype(float)
+    else:
+        out["stock_pressure_6m"] = 0.0
+        out["stock_crunch_flag"] = 0.0
+
+    out["rent_spike_stock_crunch"] = out["rent_spike_flag"] * out["stock_crunch_flag"]
+
+    return out
+
+
+def add_sparse_market_features(
+    df: pd.DataFrame,
+    *,
+    group_col: str = "sa2_code",
+    month_col: str = "month",
+    rent_col: str = "median_rent",
+    lodgement_col: str = "count_lodgements",
+    stock_col: str = "stock_bonds",
+    low_lodgement_threshold: float = 5.0,
+) -> pd.DataFrame:
+    """Augment ``df`` with features tailored to thin-market SA2s.
+
+    Adds lodgement scarcity indicators, recent rent spike intensities, and
+    interactions that highlight when shocks collide with low coverage.
+    """
+
+    out = df.sort_values([group_col, month_col]).copy()
+
+    # Lodgement-derived features -------------------------------------------------
+    if lodgement_col in out.columns:
+        lodgements = pd.to_numeric(out[lodgement_col], errors="coerce").fillna(0.0)
+        grp = out[group_col]
+
+        def _rolling_ratio(values: pd.Series, window: int) -> pd.Series:
+            roll = values.rolling(window=window, min_periods=1).mean()
+            ratio = np.divide(values, roll, out=np.zeros_like(values, dtype=float), where=roll != 0)
+            return np.nan_to_num(ratio - 1.0, nan=0.0, posinf=0.0, neginf=0.0)
+
+        out["lodgement_rel_3m"] = (
+            lodgements.groupby(grp).transform(lambda s: _rolling_ratio(s, 3))
+        )
+        out["lodgement_rel_12m"] = (
+            lodgements.groupby(grp).transform(lambda s: _rolling_ratio(s, 12))
+        )
+
+        month_group = out.groupby(month_col)[lodgement_col]
+        month_median = month_group.transform("median").replace({0.0: np.nan})
+        month_mean = month_group.transform("mean")
+        month_std = month_group.transform("std").replace({0.0: np.nan})
+
+        wa_ratio = np.divide(lodgements, month_median, out=np.ones_like(lodgements, dtype=float), where=month_median.notna())
+        wa_ratio = np.nan_to_num(wa_ratio - 1.0, nan=0.0, posinf=0.0, neginf=0.0)
+        out["lodgement_wa_ratio"] = wa_ratio
+
+        zscore = (lodgements - month_mean) / month_std
+        zscore = zscore.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["lodgement_wa_zscore"] = zscore.astype(float)
+
+        out["low_lodgement_flag"] = (lodgements <= float(low_lodgement_threshold)).astype(float)
+        out["lodgement_dropout_flag"] = (
+            (out["lodgement_rel_3m"] < -0.4) | (out["lodgement_wa_ratio"] < -0.5)
+        ).astype(float)
+    else:
+        defaults = {
+            "lodgement_rel_3m": 0.0,
+            "lodgement_rel_12m": 0.0,
+            "lodgement_wa_ratio": 0.0,
+            "lodgement_wa_zscore": 0.0,
+            "low_lodgement_flag": 0.0,
+            "lodgement_dropout_flag": 0.0,
+        }
+        for col, val in defaults.items():
+            out[col] = float(val)
+
+    # Rent shock recency features -----------------------------------------------
+    if rent_col in out.columns:
+        rent_change = out.groupby(group_col)[rent_col].pct_change(fill_method=None)
+        rent_change = rent_change.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        pos_change = rent_change.clip(lower=0.0)
+
+        out["rent_spike_recent_3m"] = (
+            pos_change.groupby(out[group_col])
+            .transform(lambda s: s.rolling(window=3, min_periods=1).max())
+            .fillna(0.0)
+        )
+        out["rent_spike_recent_6m"] = (
+            pos_change.groupby(out[group_col])
+            .transform(lambda s: s.rolling(window=6, min_periods=1).max())
+            .fillna(0.0)
+        )
+        out["rent_spike_ewma"] = (
+            pos_change.groupby(out[group_col])
+            .transform(lambda s: s.ewm(alpha=0.5, adjust=False).mean())
+            .fillna(0.0)
+        )
+    else:
+        for col in ["rent_spike_recent_3m", "rent_spike_recent_6m", "rent_spike_ewma"]:
+            out[col] = 0.0
+
+    # Low-stock indicator and thin-market interactions --------------------------
+    if stock_col in out.columns:
+        month_quant = out.groupby(month_col)[stock_col].transform(lambda s: s.quantile(0.25))
+        out["low_stock_flag_sparse"] = (
+            pd.to_numeric(out[stock_col], errors="coerce") <= month_quant
+        ).astype(float).fillna(0.0)
+    else:
+        out["low_stock_flag_sparse"] = 0.0
+
+    out["thin_market_flag"] = np.maximum(out["low_lodgement_flag"], out["low_stock_flag_sparse"])
+    out["thin_market_spike_recent"] = out["thin_market_flag"] * out["rent_spike_recent_3m"]
+    out["thin_market_spike_ewma"] = out["thin_market_flag"] * out["rent_spike_ewma"]
+    out["thin_market_dropout"] = out["thin_market_flag"] * out["lodgement_dropout_flag"]
+
+    # Mild clipping to avoid extreme leverage
+    clip_targets = {
+        "lodgement_rel_3m": (-1.0, 3.0),
+        "lodgement_rel_12m": (-1.0, 3.0),
+        "lodgement_wa_ratio": (-1.0, 3.0),
+        "lodgement_wa_zscore": (-4.0, 4.0),
+        "rent_spike_recent_3m": (0.0, 1.5),
+        "rent_spike_recent_6m": (0.0, 1.5),
+        "rent_spike_ewma": (0.0, 1.5),
+        "thin_market_spike_recent": (0.0, 1.5),
+        "thin_market_spike_ewma": (0.0, 1.5),
+    }
+    for col, (lo, hi) in clip_targets.items():
+        if col in out.columns:
+            out[col] = out[col].clip(lower=lo, upper=hi)
+
+    return out
+
+
 def add_churn_proxy(
     df: pd.DataFrame,
     *,
@@ -269,6 +465,30 @@ def compute_wa_aggregates(
     return out.sort_values(month_col).reset_index(drop=True)
 
 
+def compute_lodgement_weights(
+    df: pd.DataFrame,
+    *,
+    lodgements_col: str = "count_lodgements",
+    smoothing: float = 12.0,
+    floor: float = 0.05,
+    cap: float = 1.0,
+) -> pd.Series:
+    """Return weights in [floor, cap] that down-weight thin months.
+
+    Uses a simple ``n / (n + smoothing)`` shrinkage so that months with
+    few lodgements have weights near ``floor`` and well-covered months
+    approach ``cap``. Missing counts fall back to ``floor``.
+    """
+
+    if lodgements_col not in df.columns:
+        return pd.Series(np.full(len(df), cap, dtype=float), index=df.index)
+    n = pd.to_numeric(df[lodgements_col], errors="coerce").fillna(0.0)
+    smoothing = max(float(smoothing), 1e-3)
+    raw = n / (n + smoothing)
+    raw = raw.clip(lower=floor, upper=cap)
+    return raw.astype(float)
+
+
 __all__ = [
     "add_calendar_features",
     "add_rent_momentum",
@@ -279,5 +499,8 @@ __all__ = [
     "add_interaction_features",
     "add_group_demean",
     "add_time_since_spike",
+    "add_supply_shock_features",
+    "add_sparse_market_features",
     "compute_wa_aggregates",
+    "compute_lodgement_weights",
 ]

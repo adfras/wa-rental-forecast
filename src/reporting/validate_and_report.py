@@ -42,8 +42,13 @@ def _geojson_minimal(gdf: gpd.GeoDataFrame) -> dict:
 
 # --- Top-20 table --------------------------------------------
 
+def _forecast_source() -> Path:
+    v2_file = STAGE_DIR / "price_pressure_forecast_sa2_v2.parquet"
+    return v2_file if v2_file.exists() else STAGE_DIR / "price_pressure_forecast_sa2.parquet"
+
+
 def top20_table() -> pd.DataFrame:
-    preds = pd.read_parquet(STAGE_DIR / "price_pressure_forecast_sa2.parquet").copy()
+    preds = pd.read_parquet(_forecast_source()).copy()
     preds["month"] = to_month(preds["month"])
     latest = preds["month"].max()
     latest_df = preds[preds["month"] == latest].copy()
@@ -59,7 +64,7 @@ def top20_table() -> pd.DataFrame:
 
 def map_forecast():
     # Read predictions (latest month implicitly merged by tooltip)
-    preds = pd.read_parquet(STAGE_DIR / "price_pressure_forecast_sa2.parquet").copy()
+    preds = pd.read_parquet(_forecast_source()).copy()
     preds["month"] = to_month(preds["month"])
     preds["sa2_code"] = preds["sa2_code"].astype(str)
 
@@ -179,7 +184,7 @@ def write_action_list(k: int = 20) -> pd.DataFrame:
     Columns: rank, sa2_code, sa2_name (if available), price_pressure_prob, month
     Output: outputs/tables/action_top{K}.csv
     """
-    preds = pd.read_parquet(STAGE_DIR / "price_pressure_forecast_sa2.parquet").copy()
+    preds = pd.read_parquet(_forecast_source()).copy()
     preds["month"] = to_month(preds["month"])  # normalize type
     latest = preds["month"].max()
     latest_df = preds[preds["month"] == latest].copy()

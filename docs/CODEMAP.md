@@ -10,6 +10,8 @@ Core pipeline (minimal set)
 - src/models/forecast.py — price-pressure forecast (hierarchical logistic)
   - Recency weighting, optional isotonic calibration (`--calibrate-isotonic`),
     optional prior-shift (`--prior-shift`), bias correction on last 6 months,
+    lodgement-aware smoothing, sparse-market feature pack (lodgement scarcity,
+    spike recency, thin-market indicators), GradientBoosting booster logit,
     and mild varying slopes on key drivers (availability_rate, churn_rate).
 - src/reporting/validate_and_report.py — Top-20 CSV, folium map, PNG
 - src/reporting/build_site.py — static site into docs/
@@ -23,6 +25,7 @@ Orchestrators
 
 Utilities (moved to tools/)
 - tools/time_split_validate.py — strict time-split + walk-forward validation helper
+- tools/sparse_sa2_diagnostic.py — summarize thin-market bias + lodgement coverage
 - tools/backfill_forecast_history.py — merges docs/data/*.json into parquet history
 - tools/scan_wa_bonds_zip.py — diagnostic: scan raw ZIP for headers/month coverage
 - tools/spatial_features.py — build SA2 adjacency (queen); neighbor features

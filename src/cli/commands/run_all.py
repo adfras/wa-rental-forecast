@@ -14,7 +14,8 @@ def main():
     run("src.data_ingest.process_bonds")
     run("src.data_ingest.map_poa_sa2")
     run("src.models.nowcast")
-    run("src.models.forecast")
+    run("src.models.forecast_v2")
+    run("tools.model_experiments")
     run("src.reporting.validate_and_report")
 
 if __name__ == '__main__':
