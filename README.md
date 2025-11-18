@@ -655,8 +655,6 @@ See `.gitignore` below; do **not** commit `data_*` or anything in `outputs/`.
   - ABS ASGS 2021 SA2 geometries & POA→SA2 correspondence.  
   Respect the licensing of each dataset when sharing outputs.
 
-- **Code**: choose a LICENSE (e.g., MIT) and place it in the repo root.
-
 ---
 
 ### One‑liner summary
