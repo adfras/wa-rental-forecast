@@ -468,6 +468,28 @@ def build_threshold_datasets(existing_docs: dict[str | None, pd.DataFrame]) -> l
         if info is not None:
             infos.append(info)
 
+    if infos:
+        def _latest_month(info: dict) -> pd.Timestamp | None:
+            months = info.get("months") or []
+            if not months:
+                return None
+            return pd.to_datetime(months).max()
+
+        latest_all = max(
+            (m for m in (_latest_month(i) for i in infos) if m is not None),
+            default=None,
+        )
+        if latest_all is not None:
+            filtered = []
+            for info in infos:
+                latest = _latest_month(info)
+                if latest == latest_all:
+                    filtered.append(info)
+            if filtered:
+                infos = filtered
+                if not any(info.get("default") for info in infos):
+                    infos[0]["default"] = True
+
     thresholds_json = [
         {
             "id": info["id"],

@@ -1,1 +1,1 @@
-[{"id": "thr0p010", "label": "Rent rise ≥ 1%", "event_threshold": 0.01, "default": false}, {"id": "thr0p020", "label": "Rent rise ≥ 2%", "event_threshold": 0.02, "default": true}, {"id": "thr0p030", "label": "Rent rise ≥ 3%", "event_threshold": 0.03, "default": false}]
+[{"id": "thr0p020", "label": "Rent rise ≥ 2%", "event_threshold": 0.02, "default": true}]
