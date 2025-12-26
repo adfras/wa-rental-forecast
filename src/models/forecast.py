@@ -23,6 +23,7 @@ from sklearn.ensemble import GradientBoostingClassifier
 from src.config import (
     EVAL_DIR,
     STAGE_DIR,
+    RAW_DIR,
     RENT_GROWTH_THRESHOLD,
     RANDOM_SEED,
     FORECAST_RECENCY_HALFLIFE,
@@ -173,17 +174,68 @@ def build_dataset(*, threshold: float = RENT_GROWTH_THRESHOLD):
     df = add_rent_momentum(df, group_col="sa2_code", month_col="month", rent_col="median_rent")
     df = add_churn_proxy(df)
 
+    # Static SA2 context (optional): SEIFA decile + population
+    try:
+        ctx = None
+        seifa_path = RAW_DIR / "seifa_sa2_2021.csv"
+        if seifa_path.exists():
+            seifa = pd.read_csv(seifa_path).copy()
+            seifa["sa2_code"] = seifa["sa2_code"].astype(str)
+            seifa["irsad_decile"] = pd.to_numeric(seifa["irsad_decile"], errors="coerce")
+            ctx = seifa[["sa2_code", "irsad_decile"]]
+        pop_path = RAW_DIR / "abs_sa2_population_2023.csv"
+        if pop_path.exists():
+            pop = pd.read_csv(pop_path).copy()
+            pop["sa2_code"] = pop["sa2_code"].astype(str)
+            pop["population"] = pd.to_numeric(pop["population"], errors="coerce")
+            pop["log_population"] = np.log1p(pop["population"])
+            pop = pop[["sa2_code", "log_population"]]
+            ctx = pop if ctx is None else ctx.merge(pop, on="sa2_code", how="outer")
+        if ctx is not None and not ctx.empty:
+            df["sa2_code"] = df["sa2_code"].astype(str)
+            df = df.merge(ctx.drop_duplicates(subset=["sa2_code"]), on="sa2_code", how="left")
+    except Exception:
+        pass
+
+    # Bonds-derived low-lift indicators
+    try:
+        if "p90_rent" in df.columns and "median_rent" in df.columns:
+            denom = df["median_rent"].replace(0, np.nan)
+            df["rent_dispersion_ratio"] = df["p90_rent"] / denom
+            df["rent_dispersion_gap"] = df["p90_rent"] - df["median_rent"]
+        if "net_stock_change" in df.columns and "stock_bonds" in df.columns:
+            denom = df["stock_bonds"].replace(0, np.nan)
+            df["net_stock_change_rate"] = df["net_stock_change"] / denom
+        if "count_disposals" in df.columns and "stock_bonds" in df.columns:
+            denom = df["stock_bonds"].replace(0, np.nan)
+            df["disposal_rate"] = df["count_disposals"] / denom
+        if "count_lodgements" in df.columns and "stock_bonds" in df.columns:
+            denom = df["stock_bonds"].replace(0, np.nan)
+            df["lodgement_rate"] = df["count_lodgements"] / denom
+        if "mean_days_held" in df.columns:
+            df["mean_days_held"] = pd.to_numeric(df["mean_days_held"], errors="coerce")
+    except Exception:
+        pass
+
     # External signals (optional, month-level) + simple lags per SA2
+    ext_feature_cols: list[str] = []
     try:
         ext = pd.read_parquet(STAGE_DIR / "external_signals.parquet").copy()
-        ext_cols = [c for c in ext.columns if c != "month"]
-        if not ext.empty and ext_cols:
+        if not ext.empty:
             ext["month"] = pd.to_datetime(ext["month"]).dt.to_period("M").dt.to_timestamp()
-            df = df.merge(ext, on="month", how="left")
-            df = df.sort_values(["sa2_code","month"]).copy()
-            for c in ext_cols:
-                df[f"{c}_lag1"] = df.groupby("sa2_code")[c].shift(1)
-                df[f"{c}_lag3"] = df.groupby("sa2_code")[c].shift(3)
+            # Keep numeric external columns only (after coercion)
+            ext_cols: list[str] = []
+            for c in [c for c in ext.columns if c != "month"]:
+                ext[c] = pd.to_numeric(ext[c], errors="coerce")
+                if pd.api.types.is_numeric_dtype(ext[c]):
+                    ext_cols.append(c)
+            if ext_cols:
+                df = df.merge(ext, on="month", how="left")
+                df = df.sort_values(["sa2_code","month"]).copy()
+                for c in ext_cols:
+                    df[f"{c}_lag1"] = df.groupby("sa2_code")[c].shift(1)
+                    df[f"{c}_lag3"] = df.groupby("sa2_code")[c].shift(3)
+                    ext_feature_cols.extend([c, f"{c}_lag1", f"{c}_lag3"])
     except Exception:
         pass
 
@@ -226,6 +278,22 @@ def build_dataset(*, threshold: float = RENT_GROWTH_THRESHOLD):
         df["rent_mom_1m"] = _winsorize_series(df["rent_mom_1m"], lower_bound=-1.0, upper_bound=1.0)
     if "rent_mom_3m" in df.columns:
         df["rent_mom_3m"] = _winsorize_series(df["rent_mom_3m"], lower_bound=-0.8, upper_bound=0.8)
+    if "irsad_decile" in df.columns:
+        df["irsad_decile"] = df["irsad_decile"].clip(lower=1.0, upper=10.0)
+    if "log_population" in df.columns:
+        df["log_population"] = df["log_population"].clip(lower=0.0)
+    if "rent_dispersion_ratio" in df.columns:
+        df["rent_dispersion_ratio"] = _winsorize_series(df["rent_dispersion_ratio"], lower_bound=0.5, upper_bound=3.0)
+    if "rent_dispersion_gap" in df.columns:
+        df["rent_dispersion_gap"] = _winsorize_series(df["rent_dispersion_gap"], lower_bound=-200.0, upper_bound=2000.0)
+    if "net_stock_change_rate" in df.columns:
+        df["net_stock_change_rate"] = _winsorize_series(df["net_stock_change_rate"], lower_bound=-1.0, upper_bound=1.0)
+    if "disposal_rate" in df.columns:
+        df["disposal_rate"] = _winsorize_series(df["disposal_rate"], lower_bound=0.0, upper_bound=3.0)
+    if "lodgement_rate" in df.columns:
+        df["lodgement_rate"] = _winsorize_series(df["lodgement_rate"], lower_bound=0.0, upper_bound=3.0)
+    if "mean_days_held" in df.columns:
+        df["mean_days_held"] = _winsorize_series(df["mean_days_held"], lower_bound=0.0, upper_bound=3650.0)
 
     # Calendar + simple lags
     df = add_calendar_features(df)
@@ -290,6 +358,18 @@ def build_dataset(*, threshold: float = RENT_GROWTH_THRESHOLD):
     ]:
         if c in df.columns:
             feat_cols.append(c)
+    for c in [
+        "irsad_decile",
+        "log_population",
+        "rent_dispersion_ratio",
+        "rent_dispersion_gap",
+        "net_stock_change_rate",
+        "disposal_rate",
+        "lodgement_rate",
+        "mean_days_held",
+    ]:
+        if c in df.columns:
+            feat_cols.append(c)
     # Price interactions
     if "price_band_high" in df.columns:
         df["availability_rate__x__price_band"] = df["availability_rate"] * df["price_band_high"]
@@ -332,14 +412,11 @@ def build_dataset(*, threshold: float = RENT_GROWTH_THRESHOLD):
             feat_cols.append(c)
     if "lodgement_weight" in df.columns:
         feat_cols.append("lodgement_weight")
-    # Optional ext + neighbor columns
-    for c in ["nbr_availability_rate", "rba_cash_rate", "wa_unemp_rate", "wa_unemp_rate_sa",
-              "wa_building_approvals", "wa_build_approvals_num",
-              "rba_cash_rate_lag1","rba_cash_rate_lag3",
-              "wa_unemp_rate_lag1","wa_unemp_rate_lag3",
-              "wa_unemp_rate_sa_lag1","wa_unemp_rate_sa_lag3",
-              "wa_building_approvals_lag1","wa_building_approvals_lag3",
-              "wa_build_approvals_num_lag1","wa_build_approvals_num_lag3"]:
+    # Optional external + neighbor columns
+    for c in ["nbr_availability_rate"]:
+        if c in df.columns:
+            feat_cols.append(c)
+    for c in dict.fromkeys(ext_feature_cols):
         if c in df.columns:
             feat_cols.append(c)
     # Drop features that are entirely NA to avoid NaN mean/std warnings and degenerate columns
@@ -490,7 +567,7 @@ def fit_forecast(
         auto_calibrate: bool = True,
         target_accept: float = 0.99,
         sampler: str = "pymc",
-        init: str = "adapt_diag_grad",
+        init: str = "jitter+adapt_diag",
         max_treedepth: int = 15,
         save_trace: str | None = None,
         summary_file: str | None = None,
@@ -1167,7 +1244,11 @@ if __name__ == "__main__":
                     help="Additional sampling retries (with more draws) allowed when R-hat exceeds the limit.")
     ap.add_argument("--retry-draw-multiplier", type=float, default=1.5,
                     help="Multiplier applied to draws/tune for each retry when R-hat is too high (default 1.5).")
+    ap.add_argument("--ignore-sigint", action="store_true",
+                    help="Ignore SIGINT during PyMC sampling (useful for long runs in fragile sessions).")
     args = ap.parse_args()
+    if args.ignore_sigint:
+        os.environ["PYMC_IGNORE_SIGINT"] = "1"
     fit_forecast(
         draws=args.draws,
         tune=args.tune,

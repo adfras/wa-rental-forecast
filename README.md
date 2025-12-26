@@ -40,6 +40,18 @@ make serve   # open http://localhost:8081
 > - Validation/run utilities moved under `tools/` (`time_split_validate`, `backfill_forecast_history`, etc.) and the docs site JSON is regenerated monthly (`docs/data/2025-01.json`…`2025-09.json`).
 > - Performance & tooling: JAX samplers for forecast, one‑click presets, DuckDB helpers, and BLAS/JAX env files (see below).
 
+> **New (Dec 2025)** – Stability + feature updates (why they matter):
+> - **External signals (ABS CPI)**: switched to the correct ABS CPI dataflow and added Perth CPI + Perth rents CPI series.  
+>   **Why:** the SDMX endpoint changed; this ensures CPI/rents series load reliably and remain comparable over time.
+> - **Low‑lift SA2 features**: added SEIFA IRSAD decile + log population and bond‑derived ratios (rent dispersion, net stock change rate, disposal/lodgement rates, mean days held).  
+>   **Why:** improves probability calibration by giving the model stable local context without overfitting.
+> - **Time‑split validator parity**: `tools/time_split_validate.py` now mirrors production features and uses shared PyMC sampling helpers.  
+>   **Why:** evaluation now matches production feature engineering, reducing train/validate drift.
+> - **PyMC stability controls**: added `--pymc-init` (default `jitter+adapt_diag`) and optional signal logging in `src/common/pymc_helpers.py`.  
+>   **Why:** avoids “Unknown initializer” errors on older PyMC versions and makes interrupt causes visible.
+> - **Interrupt diagnostics**: set `LOG_SIGNALS=1` + `SIGNAL_LOG_PATH=outputs/signal.log` to capture SIGINT/SIGTERM chain.  
+>   **Why:** explains “Not enough samples to build a trace” when runs are interrupted mid‑sample.
+
 ### Performance & Tooling (Sept 2025)
 
 - JAX samplers (forecast): `src/models/forecast.py` now supports `--sampler {pymc,blackjax,numpyro}`, `--target-accept`, and `--init`. Divergence count is printed after sampling.
@@ -620,6 +632,11 @@ Cron tips:
 - Ensure the compile cache is writable: `export PYTENSOR_FLAGS="${PYTENSOR_FLAGS},base_compiledir=./.pytensor"`.
 - Use single-core dev settings while debugging: `--chains 1 --cores 1`.
 - The `src.cli.commands.one_click` entrypoint already sets `base_compiledir=./.pytensor` if not present.
+
+**PyMC "Not enough samples to build a trace"**  
+- This almost always means the sampler was **interrupted mid‑draw** (SIGINT/SIGTERM or session drop).  
+- To diagnose: `export LOG_SIGNALS=1 SIGNAL_LOG_PATH=outputs/signal.log` and re-run to capture the signal source.  
+- To prevent interrupts during long runs: run inside `tmux`, or set `PYMC_IGNORE_SIGINT=1` for production batch runs.
 
 **Keep the repo small**  
 See `.gitignore` below; do **not** commit `data_*` or anything in `outputs/`.

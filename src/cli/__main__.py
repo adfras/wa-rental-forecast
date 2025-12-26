@@ -6,6 +6,7 @@ import subprocess
 import sys
 from textwrap import dedent
 
+from src.common.signal_logging import enable_signal_logging
 COMMANDS = {
     "fetch-bonds": "src.data_ingest.fetch_bonds",
     "process-bonds": "src.data_ingest.process_bonds",
@@ -72,6 +73,10 @@ def dispatch(module: str, args: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> None:
     ns = parse_args(argv)
+    try:
+        enable_signal_logging()
+    except Exception:
+        pass
     if ns.list or not ns.command:
         print("Available commands:\n" + _list_commands())
         return

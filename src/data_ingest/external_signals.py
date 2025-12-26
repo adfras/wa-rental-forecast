@@ -518,9 +518,9 @@ def main() -> None:
 
     if cpi_df.empty:
         dataflow = os.getenv("ABS_PERTH_CPI_DATAFLOW", "CPI")
-        key = os.getenv("ABS_PERTH_CPI_KEY", "1.10001.10.5.Q")
+        key = os.getenv("ABS_PERTH_CPI_KEY", "1.10001.10.5.M")
         if key:
-            start_period = os.getenv("ABS_PERTH_CPI_START", "2010-Q1")
+            start_period = os.getenv("ABS_PERTH_CPI_START", "2010-01")
             tmp = _fetch_abs_series_via_curl(dataflow=dataflow, key=key, start_period=start_period)
             if not tmp.empty:
                 cpi_df = tmp.rename(columns={"value": "perth_cpi"})[["month", "perth_cpi"]]
@@ -550,11 +550,15 @@ def main() -> None:
             cpi_rent_df = tmp.rename(columns={"value": "perth_rent_cpi"})[["month", "perth_rent_cpi"]]
 
     if cpi_rent_df.empty:
-        rent_key = os.getenv("ABS_PERTH_RENTS_KEY", "1.30003.10.5.M")
-        start_period = os.getenv("ABS_PERTH_RENTS_START", "2015-01")
-        tmp = _fetch_abs_series_via_curl(dataflow="CPI_M", key=rent_key, start_period=start_period)
-        if not tmp.empty:
-            cpi_rent_df = tmp.rename(columns={"value": "perth_rent_cpi"})[["month", "perth_rent_cpi"]]
+        dataflow = os.getenv("ABS_PERTH_RENTS_DATAFLOW", "CPI")
+        start_period = os.getenv("ABS_PERTH_RENTS_START", "2010-01")
+        rent_key_env = os.getenv("ABS_PERTH_RENTS_KEY")
+        rent_keys = [rent_key_env] if rent_key_env else ["1.115522.10.5.M", "1.30014.10.5.M"]
+        for rent_key in [k for k in rent_keys if k]:
+            tmp = _fetch_abs_series_via_curl(dataflow=dataflow, key=rent_key, start_period=start_period)
+            if not tmp.empty:
+                cpi_rent_df = tmp.rename(columns={"value": "perth_rent_cpi"})[["month", "perth_rent_cpi"]]
+                break
 
     if cpi_rent_df.empty:
         tmp = _load_csv_if_exists(EXT_DIR / "perth_rent_cpi.csv",

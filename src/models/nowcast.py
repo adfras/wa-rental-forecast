@@ -9,6 +9,7 @@ Builds features from the SA2 panel and fits an NB model with:
 Writes `data_stage/availability_nowcast_sa2.parquet` with availability_rate.
 """
 import argparse
+import os
 
 import arviz as az
 import numpy as np
@@ -113,7 +114,11 @@ if __name__ == "__main__":
                     help="Target acceptance rate for NUTS (default 0.98)")
     ap.add_argument("--max-treedepth", type=int, default=15,
                     help="Maximum tree depth for NUTS (default 15)")
+    ap.add_argument("--ignore-sigint", action="store_true",
+                    help="Ignore SIGINT during PyMC sampling (useful for long runs in fragile sessions).")
     args = ap.parse_args()
+    if args.ignore_sigint:
+        os.environ["PYMC_IGNORE_SIGINT"] = "1"
     fit_nowcast(
         draws=args.draws,
         tune=args.tune,

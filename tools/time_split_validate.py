@@ -37,6 +37,7 @@ except Exception:  # pragma: no cover - import failure only hits in unusual envs
 
 from src.config import (
     STAGE_DIR,
+    RAW_DIR,
     RENT_GROWTH_THRESHOLD,
     RANDOM_SEED,
     FORECAST_RECENCY_HALFLIFE,
@@ -61,6 +62,7 @@ from src.features.engineering import (
     standardize_columns,
 )
 from src.models.nowcast_design import prepare_design
+from src.common.pymc_helpers import sample_nuts
 
 # Optional ML deps (graceful fallback)
 try:
@@ -90,9 +92,21 @@ def _load_external_signals():
         return None, []
 
 
-def _progress(iterable, *, desc: str):
+LOW_LIFT_FEATURES = [
+    "irsad_decile",
+    "log_population",
+    "rent_dispersion_ratio",
+    "rent_dispersion_gap",
+    "net_stock_change_rate",
+    "disposal_rate",
+    "lodgement_rate",
+    "mean_days_held",
+]
+
+
+def _progress(iterable, *, desc: str, enabled: bool = True):
     """Return iterable wrapped in a tqdm progress bar when available."""
-    if tqdm is None:
+    if not enabled or tqdm is None:
         return iterable
     try:
         total = len(iterable)  # type: ignore[arg-type]
@@ -166,7 +180,8 @@ def fit_nowcast_train(df: pd.DataFrame,
                       target_accept: float = 0.95,
                       trace_dir: 'Path | None' = None,
                       trace_name: str | None = None,
-                      recency_half_life: float | None = None) -> Tuple[NowcastPosterior, np.ndarray, np.ndarray, pd.DataFrame]:
+                      recency_half_life: float | None = None,
+                      progressbar: bool = True) -> Tuple[NowcastPosterior, np.ndarray, np.ndarray, pd.DataFrame]:
     """
     Fit the NB nowcast on train_months only. Returns:
       - NowcastPosterior (stacked draws of components)
@@ -218,9 +233,14 @@ def fit_nowcast_train(df: pd.DataFrame,
             y_dist = pm.NegativeBinomial.dist(mu=mu, alpha=alpha_nb)
             pm.Potential("weighted_loglik_nb", (w_now * pm.logp(y_dist, y)).sum())
 
-        idata = pm.sample(
-            draws=draws, tune=tune, chains=chains, cores=cores, target_accept=target_accept,
-            random_seed=RANDOM_SEED, progressbar=True
+        idata = sample_nuts(
+            draws=draws,
+            tune=tune,
+            chains=chains,
+            cores=cores,
+            target_accept=target_accept,
+            random_seed=RANDOM_SEED,
+            progressbar=progressbar,
         )
     # Optional: persist trace for verification
     if trace_dir is not None:
@@ -311,10 +331,11 @@ def fit_forecast_train(train_df: pd.DataFrame,
                        trace_name: str | None = None,
                        leakage_canary: bool = False,
                        recency_half_life: float | None = None,
-                       init: str = "adapt_diag_grad",
+                       init: str = "jitter+adapt_diag",
                        rhat_max: float = 1.01,
                        sampler_retries: int = 2,
-                       retry_draw_multiplier: float = 1.5) -> Tuple[ForecastPosterior, pd.DataFrame]:
+                       retry_draw_multiplier: float = 1.5,
+                       progressbar: bool = True) -> Tuple[ForecastPosterior, pd.DataFrame]:
     # Prepare features/labels (impute NaNs with feature-wise train means to keep early months)
     df = train_df.dropna(subset=["y"]).copy()
     df["_is_pseudo"] = False
@@ -429,14 +450,14 @@ def fit_forecast_train(train_df: pd.DataFrame,
             pm.Potential("weighted_loglik_binom", (w * pm.logp(y_dist, y)).sum())
         def _run_pymc(draws_now: int, tune_now: int, init_arg: str) -> az.InferenceData:
             t0_local = time.time()
-            idata_local = pm.sample(
+            idata_local = sample_nuts(
                 draws=draws_now,
                 tune=tune_now,
                 chains=chains,
                 cores=cores,
                 target_accept=target_accept,
                 random_seed=RANDOM_SEED,
-                progressbar=True,
+                progressbar=progressbar,
                 init=init_arg,
             )
             try:
@@ -600,9 +621,13 @@ def _train_gbm_model(train_df: pd.DataFrame,
     if train_df.empty:
         raise SystemExit("GBM training received an empty frame.")
 
-    X = train_df[feat_cols].to_numpy(dtype=float)
-    y = train_df["y"].astype(int).to_numpy()
-    sample_weight = compute_recency_weights(train_df["month"], recency_half_life)
+    df = train_df.dropna(subset=["y"]).copy()
+    if df.empty:
+        raise SystemExit("GBM training received an empty frame after dropping missing labels.")
+
+    X = df[feat_cols].to_numpy(dtype=float)
+    y = df["y"].astype(int).to_numpy()
+    sample_weight = compute_recency_weights(df["month"], recency_half_life)
 
     if lgb is not None:
         params = dict(
@@ -631,15 +656,15 @@ def _train_gbm_model(train_df: pd.DataFrame,
 
         if val_fraction and 0 < val_fraction < 1:
             # Chronologically split by month so validation is forward-looking
-            months_sorted = sorted(train_df["month"].unique())
+            months_sorted = sorted(df["month"].unique())
             split_idx = int(len(months_sorted) * (1 - val_fraction))
             if split_idx < 1:
                 split_idx = len(months_sorted) - 1
             split_idx = max(1, min(split_idx, len(months_sorted) - 1))
             train_month_subset = set(months_sorted[:split_idx])
             valid_month_subset = set(months_sorted[split_idx:])
-            train_mask = train_df["month"].isin(train_month_subset)
-            valid_mask = train_df["month"].isin(valid_month_subset)
+            train_mask = df["month"].isin(train_month_subset)
+            valid_mask = df["month"].isin(valid_month_subset)
 
             X_train = X[train_mask.to_numpy()]
             y_train = y[train_mask.to_numpy()]
@@ -809,6 +834,69 @@ def _winsorize_series(s: pd.Series,
     return series.clip(lower=low, upper=high)
 
 
+def _add_low_lift_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add static SEIFA/population context and bonds-derived rates."""
+    try:
+        ctx = None
+        seifa_path = RAW_DIR / "seifa_sa2_2021.csv"
+        if seifa_path.exists():
+            seifa = pd.read_csv(seifa_path).copy()
+            seifa["sa2_code"] = seifa["sa2_code"].astype(str)
+            seifa["irsad_decile"] = pd.to_numeric(seifa["irsad_decile"], errors="coerce")
+            ctx = seifa[["sa2_code", "irsad_decile"]]
+        pop_path = RAW_DIR / "abs_sa2_population_2023.csv"
+        if pop_path.exists():
+            pop = pd.read_csv(pop_path).copy()
+            pop["sa2_code"] = pop["sa2_code"].astype(str)
+            pop["population"] = pd.to_numeric(pop["population"], errors="coerce")
+            pop["log_population"] = np.log1p(pop["population"])
+            pop = pop[["sa2_code", "log_population"]]
+            ctx = pop if ctx is None else ctx.merge(pop, on="sa2_code", how="outer")
+        if ctx is not None and not ctx.empty:
+            df["sa2_code"] = df["sa2_code"].astype(str)
+            df = df.merge(ctx.drop_duplicates(subset=["sa2_code"]), on="sa2_code", how="left")
+    except Exception:
+        pass
+
+    try:
+        if "p90_rent" in df.columns and "median_rent" in df.columns:
+            denom = df["median_rent"].replace(0, np.nan)
+            df["rent_dispersion_ratio"] = df["p90_rent"] / denom
+            df["rent_dispersion_gap"] = df["p90_rent"] - df["median_rent"]
+        if "net_stock_change" in df.columns and "stock_bonds" in df.columns:
+            denom = df["stock_bonds"].replace(0, np.nan)
+            df["net_stock_change_rate"] = df["net_stock_change"] / denom
+        if "count_disposals" in df.columns and "stock_bonds" in df.columns:
+            denom = df["stock_bonds"].replace(0, np.nan)
+            df["disposal_rate"] = df["count_disposals"] / denom
+        if "count_lodgements" in df.columns and "stock_bonds" in df.columns:
+            denom = df["stock_bonds"].replace(0, np.nan)
+            df["lodgement_rate"] = df["count_lodgements"] / denom
+        if "mean_days_held" in df.columns:
+            df["mean_days_held"] = pd.to_numeric(df["mean_days_held"], errors="coerce")
+    except Exception:
+        return df
+
+    if "irsad_decile" in df.columns:
+        df["irsad_decile"] = df["irsad_decile"].clip(lower=1.0, upper=10.0)
+    if "log_population" in df.columns:
+        df["log_population"] = df["log_population"].clip(lower=0.0)
+    if "rent_dispersion_ratio" in df.columns:
+        df["rent_dispersion_ratio"] = _winsorize_series(df["rent_dispersion_ratio"], lower_bound=0.5, upper_bound=3.0)
+    if "rent_dispersion_gap" in df.columns:
+        df["rent_dispersion_gap"] = _winsorize_series(df["rent_dispersion_gap"], lower_bound=-200.0, upper_bound=2000.0)
+    if "net_stock_change_rate" in df.columns:
+        df["net_stock_change_rate"] = _winsorize_series(df["net_stock_change_rate"], lower_bound=-1.0, upper_bound=1.0)
+    if "disposal_rate" in df.columns:
+        df["disposal_rate"] = _winsorize_series(df["disposal_rate"], lower_bound=0.0, upper_bound=3.0)
+    if "lodgement_rate" in df.columns:
+        df["lodgement_rate"] = _winsorize_series(df["lodgement_rate"], lower_bound=0.0, upper_bound=3.0)
+    if "mean_days_held" in df.columns:
+        df["mean_days_held"] = _winsorize_series(df["mean_days_held"], lower_bound=0.0, upper_bound=3650.0)
+
+    return df
+
+
 def _clip_standardized_matrix(X: np.ndarray,
                               *,
                               quantile: float = 0.995,
@@ -855,11 +943,13 @@ def main(train_start: pd.Timestamp,
          gbm_val_fraction: float = 0.2,
          gbm_log_period: int | None = 50,
          pymc_target_accept: float = 0.99,
+         pymc_init: str = "jitter+adapt_diag",
          sampler_rhat_max: float = 1.01,
          sampler_retries: int = 2,
          retry_draw_multiplier: float = 1.5,
          force_refit_nowcast: bool = False,
-         output_suffix: str | None = None):
+         output_suffix: str | None = None,
+         progressbar: bool = True):
     # Load SA2 panel
     sa2 = pd.read_parquet(STAGE_DIR / "bonds_panel_sa2.parquet").copy()
     ensure_columns(sa2, ["sa2_code", "month", "median_rent", "count_disposals", "stock_bonds"])
@@ -913,6 +1003,7 @@ def main(train_start: pd.Timestamp,
                 trace_dir=trace_dir,
                 trace_name=f"nowcast_{train_start.strftime('%Y-%m')}_{train_end.strftime('%Y-%m')}.nc" if trace_dir else None,
                 recency_half_life=recency_half_life,
+                progressbar=progressbar,
             )
 
             # Availability for train (in-sample) and base months (OOS)
@@ -1000,6 +1091,10 @@ def main(train_start: pd.Timestamp,
                         feat_cols.append(c)
         except Exception:
             pass
+        df = _add_low_lift_features(df)
+        for c in LOW_LIFT_FEATURES:
+            if c not in feat_cols and c in df.columns:
+                feat_cols.append(c)
         if with_spatial and "nbr_availability_rate" in avail_all.columns:
             # Merge neighbor feature into df
             df = df.merge(
@@ -1072,6 +1167,7 @@ def main(train_start: pd.Timestamp,
             post_fc, _ = fit_forecast_train(
                 train_df, feat_cols, draws=draws, tune=tune, chains=chains, cores=cores,
                 target_accept=pymc_target_accept,
+                init=pymc_init,
                 trace_dir=trace_dir,
                 trace_name=(f"forecast_{train_start.strftime('%Y-%m')}_{train_end.strftime('%Y-%m')}"
                             f"_val_{val_start.strftime('%Y-%m')}_{val_end.strftime('%Y-%m')}.nc") if trace_dir else None,
@@ -1080,6 +1176,7 @@ def main(train_start: pd.Timestamp,
                 rhat_max=sampler_rhat_max,
                 sampler_retries=sampler_retries,
                 retry_draw_multiplier=retry_draw_multiplier,
+                progressbar=progressbar,
             )
             if post_fc.divergences:
                 print(
@@ -1134,7 +1231,7 @@ def main(train_start: pd.Timestamp,
         train_n = len(train_df)
         train_pos = int(train_df["y"].sum()) if "y" in train_df.columns else 0
         train_rate = train_pos / train_n if train_n else float("nan")
-        for T in _progress(sorted(val_months), desc="Validation months"):
+        for T in _progress(sorted(val_months), desc="Validation months", enabled=progressbar):
             base_m = prev_month(T)
             base_df = df[df["month"] == base_m].copy()
             if base_df.empty:
@@ -1231,7 +1328,7 @@ def main(train_start: pd.Timestamp,
         preds = []
         # We reuse processed SA2 with momentum
         cached_notice_emitted = False
-        for T in _progress(sorted(val_months), desc="Walk-forward months"):
+        for T in _progress(sorted(val_months), desc="Walk-forward months", enabled=progressbar):
             base_m = prev_month(T)
             # Define windows:
             # - Nowcast trained on months in [train_start .. base_m]
@@ -1254,6 +1351,7 @@ def main(train_start: pd.Timestamp,
                     sa2, now_train_months, draws=draws, tune=tune, chains=chains, cores=cores,
                     trace_dir=trace_dir,
                     trace_name=f"nowcast_until_{base_m.strftime('%Y-%m')}.nc" if trace_dir else None,
+                    progressbar=progressbar,
                 )
                 avail_train = pd.DataFrame({
                     "sa2_code": train_keys["sa2_code"].values,
@@ -1278,6 +1376,10 @@ def main(train_start: pd.Timestamp,
                     on=["sa2_code", "month"], how="left")
                 if "nbr_availability_rate" not in feat_cols:
                     feat_cols.append("nbr_availability_rate")
+            df_step = _add_low_lift_features(df_step)
+            for c in LOW_LIFT_FEATURES:
+                if c not in feat_cols and c in df_step.columns:
+                    feat_cols.append(c)
             # === Merge external signals (optional) ===
             if with_external:
                 ext_df, ext_cols = _load_external_signals()
@@ -1342,6 +1444,7 @@ def main(train_start: pd.Timestamp,
                 post_fc, _ = fit_forecast_train(
                     train_df, feat_cols, draws=draws, tune=tune, chains=chains, cores=cores,
                     target_accept=pymc_target_accept,
+                    init=pymc_init,
                     trace_dir=trace_dir,
                     trace_name=f"forecast_until_{prev_month(prev_month(T)).strftime('%Y-%m')}.nc" if trace_dir else None,
                     leakage_canary=leakage_canary,
@@ -1349,6 +1452,7 @@ def main(train_start: pd.Timestamp,
                     rhat_max=sampler_rhat_max,
                     sampler_retries=sampler_retries,
                     retry_draw_multiplier=retry_draw_multiplier,
+                    progressbar=progressbar,
                 )
                 if post_fc.divergences:
                     print(
@@ -1455,8 +1559,10 @@ def main(train_start: pd.Timestamp,
                         _post_tmp, _ = fit_forecast_train(
                             train_df, feat_cols, draws=max(400, draws//2), tune=max(400, tune//2),
                             chains=1, cores=1, target_accept=pymc_target_accept,
+                            init=pymc_init,
                             leakage_canary=leakage_canary,
                             recency_half_life=recency_half_life,
+                            progressbar=progressbar,
                         )
                         p_train, _, _, _ = predict_forecast(_post_tmp, train_df, feat_cols)
                     y_train = train_df["y"].astype(int).to_numpy()
@@ -1549,6 +1655,8 @@ if __name__ == "__main__":
                     help="Emit LightGBM eval logs every N rounds (set 0 to silence)")
     ap.add_argument("--pymc-target-accept", type=float, default=0.99,
                     help="Target acceptance rate for PyMC NUTS (default 0.99)")
+    ap.add_argument("--pymc-init", type=str, default="jitter+adapt_diag",
+                    help="Initializer passed to PyMC NUTS (default jitter+adapt_diag)")
     ap.add_argument("--sampler-rhat-max", type=float, default=1.01,
                     help="Maximum acceptable rank-based R-hat before adding more draws (default 1.01).")
     ap.add_argument("--sampler-retries", type=int, default=2,
@@ -1557,6 +1665,10 @@ if __name__ == "__main__":
                     help="Multiplier applied to draws/tune for each retry (default 1.5).")
     ap.add_argument("--force-refit-nowcast", action="store_true",
                     help="Ignore cached availability and refit the PyMC nowcast")
+    ap.add_argument("--no-progressbar", action="store_true",
+                    help="Disable PyMC/tqdm progress bars for cleaner logs.")
+    ap.add_argument("--ignore-sigint", action="store_true",
+                    help="Ignore SIGINT during PyMC sampling (useful for long runs in fragile sessions).")
     ap.add_argument("--output-suffix", type=str, default=None,
                     help="Optional suffix for output files (overrides auto suffix when using alternate thresholds).")
     args = ap.parse_args()
@@ -1564,6 +1676,10 @@ if __name__ == "__main__":
     from pathlib import Path as _Path
     tdir = _Path(args.trace_dir) if args.trace_dir else None
     thresholds = args.threshold_grid if args.threshold_grid else [args.threshold]
+
+    progressbar = not args.no_progressbar
+    if args.ignore_sigint:
+        os.environ["PYMC_IGNORE_SIGINT"] = "1"
 
     for thr in thresholds:
         suffix = args.output_suffix
@@ -1583,8 +1699,10 @@ if __name__ == "__main__":
              gbm_early_stopping=args.gbm_early_stopping,
              gbm_val_fraction=args.gbm_val_fraction, gbm_log_period=args.gbm_log_period,
              pymc_target_accept=args.pymc_target_accept,
+             pymc_init=args.pymc_init,
              sampler_rhat_max=args.sampler_rhat_max,
              sampler_retries=args.sampler_retries,
              retry_draw_multiplier=args.retry_draw_multiplier,
              force_refit_nowcast=args.force_refit_nowcast,
-             output_suffix=suffix)
+             output_suffix=suffix,
+             progressbar=progressbar)

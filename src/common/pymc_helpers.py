@@ -2,8 +2,45 @@
 from __future__ import annotations
 
 from typing import Any
+import contextlib
+import os
+import signal
 
 import pymc as pm
+from .signal_logging import enable_signal_logging, get_signal_handler, logging_requested
+
+
+def _truthy_env(name: str) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
+
+
+@contextlib.contextmanager
+def _maybe_ignore_sigint(enabled: bool):
+    if not enabled:
+        yield
+        return
+    try:
+        prev_handler = signal.getsignal(signal.SIGINT)
+        if logging_requested():
+            handler = get_signal_handler()
+            if handler is not None:
+                signal.signal(signal.SIGINT, handler)
+            else:
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+        else:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        # Signal handling may be unavailable in non-main threads; proceed without changes.
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            signal.signal(signal.SIGINT, prev_handler)
+        except Exception:
+            pass
 
 
 def _parse_version(raw: str) -> tuple[int, ...]:
@@ -30,6 +67,7 @@ def sample_nuts(
     max_treedepth: int = 10,
     random_seed: int | None = None,
     progressbar: bool = True,
+    ignore_sigint: bool | None = None,
     **kwargs: Any,
 ) -> Any:
     """Call :func:`pm.sample` using an instantiated NUTS step.
@@ -54,8 +92,15 @@ def sample_nuts(
     }
     sample_kwargs.update(kwargs)
 
+    if ignore_sigint is None:
+        ignore_sigint = _truthy_env("PYMC_IGNORE_SIGINT")
     try:
-        return pm.sample(**sample_kwargs)
+        enable_signal_logging()
+    except Exception:
+        pass
+    try:
+        with _maybe_ignore_sigint(bool(ignore_sigint)):
+            return pm.sample(**sample_kwargs)
     except ValueError as exc:
         message = str(exc)
         if "Invalid key" in message and "step_kwargs" in message:

@@ -39,5 +39,6 @@ certs/ckan_ca_bundle.pem
 # Compiler caches
 .pytensor/
 .pytensor_cache/
+.pytensor_compiledir/
 certs/
 repomix-clean.xml
